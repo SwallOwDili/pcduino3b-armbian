@@ -109,19 +109,22 @@ jobs:
           }
 
           mapfile -t xz_images < <(find build/output/images -maxdepth 1 -type f -name '*.img.xz' | sort)
-          mapfile -t raw_images < <(find build/output/images -maxdepth 1 -type f -name '*.img' | sort)
           [[ ${#xz_images[@]} -ge 1 ]] || { echo 'No .img.xz image produced' >&2; exit 1; }
-          [[ ${#raw_images[@]} -ge 1 ]] || { echo 'No raw .img image produced for inspection' >&2; exit 1; }
 
           XZ_IMAGE="${xz_images[0]}"
-          RAW_IMAGE="${raw_images[0]}"
           xz -t "$XZ_IMAGE"
+
+          # Armbian's xz stage intentionally deletes the uncompressed .img.
+          # Decompress a temporary inspection copy; the published artifact remains .img.xz.
+          RAW_IMAGE="$RUNNER_TEMP/pcduino3b-ci-inspection.img"
+          xz -T0 -dc "$XZ_IMAGE" > "$RAW_IMAGE"
 
           MNT="$(mktemp -d)"
           LOOP="$(sudo losetup --find --show --partscan "$RAW_IMAGE")"
           cleanup() {
             sudo umount "$MNT" 2>/dev/null || true
             sudo losetup -d "$LOOP" 2>/dev/null || true
+            rm -f "$RAW_IMAGE" 2>/dev/null || true
             rmdir "$MNT" 2>/dev/null || true
           }
           trap cleanup EXIT
