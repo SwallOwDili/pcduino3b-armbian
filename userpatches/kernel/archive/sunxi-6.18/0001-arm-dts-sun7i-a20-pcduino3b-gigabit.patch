@@ -1,0 +1,38 @@
+From 3d57550d3fcb42ccbb1172c3e19ea4a5b177aa7f Mon Sep 17 00:00:00 2001
+From: pcDuino3B Armbian CI <noreply@github.com>
+Date: Fri, 4 Sep 2026 03:00:00 +0800
+Subject: [PATCH] ARM: dts: sun7i: pcduino3: switch GMAC to RGMII for 3B
+
+The LinkSprite pcDuino3B replaces the original pcDuino3 10/100 PHY
+interface with a Gigabit Ethernet PHY wired through RGMII.  The board
+layout follows the pcDuino3, while its GMAC wiring matches pcDuino3
+Nano for this interface.
+
+Use the A20 RGMII pin group and RGMII internal-delay mode so the
+stmmac/PHY stack can negotiate 1000BASE-T on pcDuino3B.
+
+This patch is intentionally carried as an Armbian userpatch because the
+upstream sun7i-a20-pcduino3.dts continues to describe the original
+(non-3B) board.
+---
+ arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts b/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
+--- a/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
++++ b/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
+@@ -121,10 +121,10 @@ &ehci1 {
+ 
+ &gmac {
+ 	pinctrl-names = "default";
+-	pinctrl-0 = <&gmac_mii_pins>;
++	pinctrl-0 = <&gmac_rgmii_pins>;
+ 	phy-handle = <&phy1>;
+-	phy-mode = "mii";
++	phy-mode = "rgmii-id";
+ 	status = "okay";
+ };
+ 
+ &i2c0 {
+-- 
+2.51.0

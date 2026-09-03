@@ -1,0 +1,209 @@
+name: Build pcDuino3B Armbian
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'userpatches/**'
+      - 'docs/**'
+      - 'README.md'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pcduino3b-armbian-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARMBIAN_BUILD_REF: 34e66c37211c70ef5cfad9c80dd76389720e19b7
+  RELEASE_TAG: pcduino3b-noble-current
+
+jobs:
+  preflight:
+    name: Static preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout customizations
+        uses: actions/checkout@v4
+
+      - name: Shell syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n userpatches/customize-image.sh
+          bash -n userpatches/extensions/pcduino3b-gigabit.sh
+          bash -n userpatches/overlay/usr/local/sbin/pcduino3b-selftest
+
+      - name: Verify pcDuino3B DTS patch against Linux v6.18
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          mkdir -p "$work/arch/arm/boot/dts/allwinner"
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/torvalds/linux/v6.18/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts \
+            -o "$work/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts"
+          cd "$work"
+          git init -q
+          git add .
+          git -c user.name=ci -c user.email=ci@example.invalid commit -qm base
+          git apply --check "$GITHUB_WORKSPACE/userpatches/kernel/archive/sunxi-6.18/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
+          git apply "$GITHUB_WORKSPACE/userpatches/kernel/archive/sunxi-6.18/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
+          grep -q 'pinctrl-0 = <&gmac_rgmii_pins>;' arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
+          grep -q 'phy-mode = "rgmii-id";' arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
+
+      - name: Verify required Gigabit kernel options are requested
+        shell: bash
+        run: |
+          set -euo pipefail
+          for opt in CONFIG_STMMAC_ETH CONFIG_STMMAC_PLATFORM CONFIG_DWMAC_SUNXI CONFIG_REALTEK_PHY; do
+            grep -q "$opt" userpatches/extensions/pcduino3b-gigabit.sh
+          done
+
+  build:
+    name: Cloud build and image acceptance
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Build Ubuntu Noble / current-sunxi image
+        uses: armbian/build@34e66c37211c70ef5cfad9c80dd76389720e19b7
+        with:
+          armbian_token: ${{ secrets.GITHUB_TOKEN }}
+          armbian_runner_clean: 'yes'
+          armbian_target: build
+          armbian_branch: 34e66c37211c70ef5cfad9c80dd76389720e19b7
+          armbian_kernel_branch: current
+          armbian_release: noble
+          armbian_board: pcduino3
+          armbian_ui: server
+          armbian_extensions: pcduino3b-gigabit
+          armbian_compress: sha,img,xz
+          armbian_release_tag: pcduino3b-noble-current
+          armbian_release_prerelease: 'true'
+          armbian_download_base_url: https://github.com/${{ github.repository }}/releases/download/pcduino3b-noble-current
+          armbian_download_repository: ''
+          armbian_release_title: pcDuino3B Armbian - Ubuntu Noble / Linux 6.18 current-sunxi
+          armbian_release_body: |
+            Rolling pcDuino3B image built entirely in GitHub Actions.
+
+            Hardware policy: Allwinner A20, pcDuino3 boot target, RGMII-ID Gigabit GMAC patch,
+            built-in STMMAC/DWMAC_SUNXI and Realtek PHY support. Ubuntu Noble package sources
+            are exercised during image construction. The release remains a pre-release until
+            the generated raw image passes the post-build filesystem, DTB, kernel-config and
+            self-test payload checks in this workflow.
+
+      - name: Post-build image acceptance
+        id: acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v dtc >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y device-tree-compiler
+          }
+
+          mapfile -t xz_images < <(find build/output/images -maxdepth 1 -type f -name '*.img.xz' | sort)
+          mapfile -t raw_images < <(find build/output/images -maxdepth 1 -type f -name '*.img' | sort)
+          [[ ${#xz_images[@]} -ge 1 ]] || { echo 'No .img.xz image produced' >&2; exit 1; }
+          [[ ${#raw_images[@]} -ge 1 ]] || { echo 'No raw .img image produced for inspection' >&2; exit 1; }
+
+          XZ_IMAGE="${xz_images[0]}"
+          RAW_IMAGE="${raw_images[0]}"
+          xz -t "$XZ_IMAGE"
+
+          MNT="$(mktemp -d)"
+          LOOP="$(sudo losetup --find --show --partscan "$RAW_IMAGE")"
+          cleanup() {
+            sudo umount "$MNT" 2>/dev/null || true
+            sudo losetup -d "$LOOP" 2>/dev/null || true
+            rmdir "$MNT" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sleep 2
+
+          ROOT_PART="$(lsblk -lnpo NAME,FSTYPE "$LOOP" | awk '$2 == "ext4" || $2 == "btrfs" {print $1; exit}')"
+          [[ -n "$ROOT_PART" ]] || { lsblk -f "$LOOP"; echo 'Root filesystem partition not found' >&2; exit 1; }
+          sudo mount -o ro "$ROOT_PART" "$MNT"
+
+          sudo test -f "$MNT/etc/os-release"
+          sudo grep -q '^VERSION_CODENAME=noble$' "$MNT/etc/os-release"
+          sudo test -x "$MNT/usr/local/sbin/pcduino3b-selftest"
+          sudo test -f "$MNT/etc/pcduino3b-build-info"
+          sudo grep -Rqs --include='*.list' --include='*.sources' 'noble' "$MNT/etc/apt"
+
+          KCONFIG="$(find "$MNT/boot" -maxdepth 1 -type f -name 'config-*' | sort | tail -n1)"
+          [[ -n "$KCONFIG" ]] || { echo 'Kernel config not found in image' >&2; exit 1; }
+          for expected in \
+            'CONFIG_STMMAC_ETH=y' \
+            'CONFIG_STMMAC_PLATFORM=y' \
+            'CONFIG_DWMAC_SUNXI=y' \
+            'CONFIG_REALTEK_PHY=y'; do
+            sudo grep -qx "$expected" "$KCONFIG" || {
+              echo "Missing kernel setting: $expected" >&2
+              exit 1
+            }
+          done
+
+          DTB="$(find "$MNT/boot" -type f -name 'sun7i-a20-pcduino3.dtb' | head -n1)"
+          [[ -n "$DTB" ]] || { echo 'pcDuino3 DTB not found in image' >&2; exit 1; }
+          sudo dtc -I dtb -O dts "$DTB" > /tmp/pcduino3-live.dts 2>/tmp/dtc-warnings.txt || {
+            cat /tmp/dtc-warnings.txt >&2
+            exit 1
+          }
+          grep -q 'phy-mode = "rgmii-id";' /tmp/pcduino3-live.dts
+
+          REPORT="$GITHUB_WORKSPACE/CI-VERIFICATION.txt"
+          {
+            echo 'pcDuino3B Armbian CI verification: PASS'
+            echo "Repository commit: $GITHUB_SHA"
+            echo "Armbian build framework: $ARMBIAN_BUILD_REF"
+            echo "Compressed image: $(basename "$XZ_IMAGE")"
+            echo "Compressed SHA256: $(sha256sum "$XZ_IMAGE" | awk '{print $1}')"
+            echo "Root filesystem: $ROOT_PART"
+            echo "Kernel config: ${KCONFIG#$MNT}"
+            echo "DTB: ${DTB#$MNT}"
+            echo 'DTB phy-mode: rgmii-id'
+            echo 'Kernel: STMMAC_ETH=y STMMAC_PLATFORM=y DWMAC_SUNXI=y REALTEK_PHY=y'
+            echo 'Userspace: Ubuntu Noble'
+            echo 'Image payload: pcduino3b-selftest installed'
+            echo 'Build-time Ubuntu source test: apt-get update + ports.ubuntu.com Noble InRelease HTTPS'
+            echo
+            echo 'Physical 1000BASE-T negotiation is intentionally an on-device acceptance item:'
+            echo '  sudo pcduino3b-selftest'
+          } | tee "$REPORT"
+
+          echo "image=$XZ_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish verification report and promote release
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" CI-VERIFICATION.txt --clobber
+          RELEASE_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id')"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F prerelease=false \
+            -F make_latest=true >/dev/null
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## pcDuino3B Armbian build'
+            echo
+            echo "- Release tag: \`$RELEASE_TAG\`"
+            echo "- Armbian build ref: \`$ARMBIAN_BUILD_REF\`"
+            echo '- Userspace: Ubuntu 24.04 Noble (armhf)'
+            echo '- Kernel branch: current-sunxi / Linux 6.18.y at the pinned build ref'
+            echo '- Gigabit DT policy: RGMII-ID'
+            echo '- Physical 1000M link check: run `sudo pcduino3b-selftest` on the board'
+          } >> "$GITHUB_STEP_SUMMARY"

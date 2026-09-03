@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# pcDuino3B on-device acceptance test.
+# Run as: sudo pcduino3b-selftest [--iperf-server 192.168.1.2] [--skip-apt]
+
+set -uo pipefail
+
+PASS=0
+FAIL=0
+WARN=0
+IPERF_SERVER=""
+RUN_APT=1
+
+while (($#)); do
+	case "$1" in
+		--iperf-server)
+			[[ $# -ge 2 ]] || { echo "--iperf-server requires a host" >&2; exit 2; }
+			IPERF_SERVER="$2"
+			shift 2
+			;;
+		--skip-apt)
+			RUN_APT=0
+			shift
+			;;
+		-h|--help)
+			echo "Usage: sudo pcduino3b-selftest [--iperf-server HOST] [--skip-apt]"
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1" >&2
+			exit 2
+			;;
+	esac
+done
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+	echo "Please run as root: sudo pcduino3b-selftest" >&2
+	exit 2
+fi
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="/var/log/pcduino3b-selftest-${STAMP}.log"
+exec > >(tee -a "$LOG") 2>&1
+
+pass() { PASS=$((PASS + 1)); printf '[PASS] %s\n' "$*"; }
+fail() { FAIL=$((FAIL + 1)); printf '[FAIL] %s\n' "$*"; }
+warn() { WARN=$((WARN + 1)); printf '[WARN] %s\n' "$*"; }
+section() { printf '\n===== %s =====\n' "$*"; }
+
+run_info() {
+	printf '+ '
+	printf '%q ' "$@"
+	printf '\n'
+	"$@" || true
+}
+
+section "Identity"
+MODEL="$(tr -d '\0' </proc/device-tree/model 2>/dev/null || true)"
+echo "Device tree model: ${MODEL:-unknown}"
+echo "Kernel: $(uname -srvm)"
+echo "Machine: $(uname -m)"
+cat /etc/os-release 2>/dev/null || true
+cat /etc/pcduino3b-build-info 2>/dev/null || true
+
+if [[ "$(dpkg --print-architecture 2>/dev/null || true)" == "armhf" ]]; then
+	pass "userspace architecture is armhf"
+else
+	fail "userspace architecture is not armhf"
+fi
+
+if grep -q '^VERSION_CODENAME=noble$' /etc/os-release 2>/dev/null; then
+	pass "Ubuntu userspace codename is noble"
+else
+	fail "Ubuntu userspace codename is not noble"
+fi
+
+if [[ "$(uname -r)" == 6.18.* ]]; then
+	pass "kernel is on the expected 6.18.y current-sunxi line ($(uname -r))"
+else
+	warn "kernel is not 6.18.y; current Armbian may have advanced ($(uname -r))"
+fi
+
+section "Device tree / Gigabit Ethernet"
+PHY_MODE_FILE="$(find /proc/device-tree -type f -name phy-mode 2>/dev/null | head -n1 || true)"
+if [[ -n "$PHY_MODE_FILE" ]]; then
+	PHY_MODE="$(tr -d '\0' <"$PHY_MODE_FILE" 2>/dev/null || true)"
+	echo "phy-mode file: $PHY_MODE_FILE"
+	echo "phy-mode: $PHY_MODE"
+	if [[ "$PHY_MODE" == "rgmii-id" ]]; then
+		pass "GMAC device tree uses rgmii-id"
+	else
+		fail "GMAC device tree phy-mode is '${PHY_MODE:-unknown}', expected rgmii-id"
+	fi
+else
+	fail "could not find a phy-mode property in the live device tree"
+fi
+
+IFACE="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+if [[ -z "$IFACE" ]]; then
+	for p in /sys/class/net/*; do
+		n="$(basename "$p")"
+		[[ "$n" == "lo" ]] && continue
+		if ethtool "$n" >/dev/null 2>&1; then IFACE="$n"; break; fi
+	done
+fi
+
+if [[ -z "$IFACE" ]]; then
+	fail "no Ethernet interface detected"
+else
+	echo "Ethernet interface: $IFACE"
+	run_info ip -details link show dev "$IFACE"
+	run_info ip address show dev "$IFACE"
+	run_info ethtool -i "$IFACE"
+	ETHTOOL_OUT="$(ethtool "$IFACE" 2>&1 || true)"
+	echo "$ETHTOOL_OUT"
+
+	SPEED="$(awk -F': ' '/^[[:space:]]*Speed:/ {print $2; exit}' <<<"$ETHTOOL_OUT")"
+	DUPLEX="$(awk -F': ' '/^[[:space:]]*Duplex:/ {print $2; exit}' <<<"$ETHTOOL_OUT")"
+	LINK="$(awk -F': ' '/^[[:space:]]*Link detected:/ {print $2; exit}' <<<"$ETHTOOL_OUT")"
+
+	if [[ "$LINK" == "yes" ]]; then
+		pass "Ethernet carrier is up"
+	else
+		fail "Ethernet carrier is down; connect a known-good Gigabit switch/router and Cat5e+ cable"
+	fi
+	if [[ "$SPEED" == "1000Mb/s" && "$DUPLEX" == "Full" ]]; then
+		pass "Ethernet negotiated 1000Mb/s Full Duplex"
+	else
+		fail "Ethernet negotiated '${SPEED:-unknown}' '${DUPLEX:-unknown}', expected 1000Mb/s Full Duplex"
+	fi
+
+	PHY_DRIVER="$(basename "$(readlink -f "/sys/class/net/$IFACE/phydev/driver" 2>/dev/null)" 2>/dev/null || true)"
+	[[ -n "$PHY_DRIVER" ]] && echo "PHY driver: $PHY_DRIVER"
+	if [[ "$PHY_DRIVER" == "realtek" ]]; then
+		pass "Realtek PHY driver is bound"
+	else
+		warn "PHY driver is '${PHY_DRIVER:-unknown}'; inspect dmesg for the actual PHY"
+	fi
+fi
+
+DMESG_NET="$(dmesg 2>/dev/null | grep -Ei 'sun7i-dwmac|stmmac|RTL821|Link is Up' | tail -n 80 || true)"
+echo "$DMESG_NET"
+if grep -Eqi 'sun7i-dwmac|stmmac' <<<"$DMESG_NET"; then
+	pass "A20 STMMAC/DWMAC messages are present in dmesg"
+else
+	warn "no STMMAC/DWMAC messages found in the current dmesg buffer"
+fi
+
+section "IP / DNS / Ubuntu source connectivity"
+run_info ip route
+if ip -4 route show default | grep -q .; then
+	pass "IPv4 default route exists"
+else
+	fail "IPv4 default route is missing"
+fi
+
+if getent ahosts ports.ubuntu.com >/dev/null 2>&1; then
+	pass "DNS resolves ports.ubuntu.com"
+else
+	fail "DNS cannot resolve ports.ubuntu.com"
+fi
+
+if curl --fail --silent --show-error --location --head \
+	--connect-timeout 10 --max-time 30 \
+	https://ports.ubuntu.com/ubuntu-ports/dists/noble/InRelease >/dev/null; then
+	pass "HTTPS reaches Ubuntu Noble ARM archive"
+else
+	fail "HTTPS cannot reach Ubuntu Noble ARM archive"
+fi
+
+if ((RUN_APT)); then
+	if apt-get update -o Acquire::Retries=3; then
+		pass "apt-get update succeeds"
+	else
+		fail "apt-get update failed"
+	fi
+else
+	warn "apt-get update skipped by request"
+fi
+
+section "Storage / USB / SATA / I2C"
+run_info lsblk -o NAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINTS,MODEL
+run_info findmnt /
+run_info df -hT /
+run_info lsusb
+run_info bash -c 'ls -l /dev/i2c-* 2>/dev/null || true'
+
+DMESG_STORAGE="$(dmesg 2>/dev/null | grep -Ei 'ahci|sata|mmc|usb' | tail -n 120 || true)"
+echo "$DMESG_STORAGE"
+if grep -Eqi 'ahci|sata' <<<"$DMESG_STORAGE"; then
+	pass "SATA/AHCI controller messages are present"
+else
+	warn "no SATA/AHCI message found; controller may be unused or dmesg may have rotated"
+fi
+
+section "System services / time / memory / CPU"
+run_info free -h
+run_info lscpu
+run_info uptime
+run_info timedatectl
+run_info systemctl --failed --no-pager
+if systemctl is-active --quiet ssh; then
+	pass "SSH service is active"
+else
+	warn "SSH service is not active"
+fi
+
+if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes; then
+	pass "system clock is NTP-synchronized"
+else
+	warn "system clock is not yet reported NTP-synchronized"
+fi
+
+if [[ -n "$IPERF_SERVER" ]]; then
+	section "LAN throughput (iperf3)"
+	if command -v iperf3 >/dev/null 2>&1; then
+		if iperf3 -c "$IPERF_SERVER" -P 4 -t 15; then
+			pass "iperf3 completed against $IPERF_SERVER"
+		else
+			fail "iperf3 failed against $IPERF_SERVER"
+		fi
+	else
+		fail "iperf3 is not installed"
+	fi
+else
+	section "LAN throughput (iperf3)"
+	warn "throughput test not run; use --iperf-server <LAN-Gigabit-host>"
+fi
+
+section "Summary"
+printf 'PASS=%d FAIL=%d WARN=%d\n' "$PASS" "$FAIL" "$WARN"
+echo "Full report: $LOG"
+
+if ((FAIL > 0)); then
+	exit 1
+fi
+exit 0
