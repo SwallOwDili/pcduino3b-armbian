@@ -11,6 +11,16 @@ function extension_prepare_config__pcduino3b_profile_suffix() {
 	esac
 }
 
+function extension_prepare_config__pcduino3b_profile_dtb() {
+	case "${PCDUINO3B_IMAGE_PROFILE:-}" in
+		nand-installer | nand-recovery)
+			# NAND experiments boot a dedicated DTB.  The normal SD DTB keeps
+			# the controller disabled and is never modified at runtime.
+			BOOT_FDT_FILE="allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb"
+			;;
+	esac
+}
+
 function extension_prepare_config__pcduino3b_packages() {
 	local -a profile_packages=()
 

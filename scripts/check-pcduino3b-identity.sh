@@ -53,9 +53,17 @@ require_match '\[\[ "\$IMAGE_PROFILE" == nand-\* \]\]' "$CUSTOMIZE" 'NAND payloa
 
 require_match 'sun7i-a20-pcduino3b\.dts' "$PATCH_FILE" 'dedicated DTS is missing from the kernel patch'
 require_match 'sun7i-a20-pcduino3b\.dtb' "$PATCH_FILE" 'dedicated DTB is missing from the kernel Makefile patch'
+require_match 'sun7i-a20-pcduino3b-nand-recovery\.dts' "$PATCH_FILE" 'NAND recovery DTS is missing from the kernel patch'
+require_match 'sun7i-a20-pcduino3b-nand-recovery\.dtb' "$PATCH_FILE" 'NAND recovery DTB is missing from the kernel Makefile patch'
 require_match 'model = "LinkSprite pcDuino3B";' "$PATCH_FILE" 'dedicated DT model is incorrect'
 require_match '#include "sun7i-a20-pcduino3\.dts"' "$PATCH_FILE" 'upstream pcDuino3 include must remain an explicit compatibility layer'
 require_match 'phy-mode = "rgmii-id";' "$PATCH_FILE" 'pcDuino3B GMAC mode is missing'
+require_match '&nfc' "$PATCH_FILE" 'NAND recovery DTS must enable the NFC explicitly'
+require_match 'allwinner,rb = <0>;' "$PATCH_FILE" 'NAND recovery DTS must use the verified ready/busy line'
+require_match 'nand-ecc-mode = "hw";' "$PATCH_FILE" 'NAND recovery DTS must request hardware ECC'
+if grep -Eq '^\+[[:space:]]*(nand-on-flash-bbt|partitions)[[:space:]{;]' "$PATCH_FILE"; then
+	fail 'NAND recovery DTS must not declare persistent BBT or a guessed partition map'
+fi
 if grep -Eq '^diff --git a/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3\.dts ' "$PATCH_FILE"; then
 	fail 'kernel patch must not modify the original pcDuino3 DTS'
 fi
@@ -74,6 +82,8 @@ require_match 'BOARD is pcduino3b' "$SELFTEST" 'selftest must validate Armbian B
 require_match 'ARMBIAN_BOARD is pcduino3b' "$SELFTEST" 'selftest must validate build-info identity'
 require_match 'RTL8211E PHY is bound' "$SELFTEST" 'selftest must accept the verified RTL8211E identity'
 require_match 'detect_ethernet_interface' "$SELFTEST" 'selftest must discover the routed Ethernet interface'
+require_match 'sun7i-a20-pcduino3b-nand-recovery\.dtb' 'userpatches/extensions/pcduino3b-gigabit.sh' \
+	'NAND profiles must select the isolated recovery DTB'
 
 forbid_match 'armbian_board:.*pcduino3([^b[:alnum:]_]|$)' \
 	'workflow still builds the legacy board slug' .github/workflows

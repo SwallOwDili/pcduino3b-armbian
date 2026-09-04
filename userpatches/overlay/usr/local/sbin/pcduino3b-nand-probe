@@ -8,6 +8,7 @@ PROC_DT_ROOT="${PCDUINO3B_PROC_DT_ROOT:-$PROC_ROOT/device-tree}"
 DEV_ROOT="${PCDUINO3B_DEV_ROOT:-/dev}"
 SYS_ROOT="${PCDUINO3B_SYS_ROOT:-/sys}"
 BOOT_ROOT="${PCDUINO3B_BOOT_ROOT:-/boot}"
+ETC_ROOT="${PCDUINO3B_ETC_ROOT:-/etc}"
 
 section() { printf '\n===== %s =====\n' "$*"; }
 
@@ -15,6 +16,19 @@ section "Safety boundary"
 echo "MODE=READ_ONLY"
 echo "INSTALLER=NOT_AUTHORIZED"
 echo "This command only reads discovery and diagnostic interfaces."
+
+section "Runtime identity"
+printf 'KERNEL=%s\n' "$(uname -r)"
+if [[ -r "$ETC_ROOT/pcduino3b-build-info" ]]; then
+	grep -E '^(BOARD|ARMBIAN_BOARD|IMAGE_PROFILE)=' "$ETC_ROOT/pcduino3b-build-info" || true
+else
+	echo "Build identity is unavailable"
+fi
+if [[ -r "$BOOT_ROOT/armbianEnv.txt" ]]; then
+	grep -E '^fdtfile=' "$BOOT_ROOT/armbianEnv.txt" || echo "fdtfile is not explicit"
+else
+	echo "Boot environment is unavailable"
+fi
 
 section "MTD table"
 if [[ -r "$PROC_ROOT/mtd" ]]; then
@@ -50,6 +64,19 @@ while IFS= read -r node; do
 	printf '%s status=%s compatible=%s\n' "$node" "${status:-unknown}" "${compatible:-unknown}"
 done < <(find -L "$PROC_DT_ROOT" -type d \( -iname '*nand*' -o -iname '*nfc*' \) 2>/dev/null | sort)
 ((DT_NODE_COUNT > 0)) || echo "No NAND/NFC node was found in the live device tree"
+
+section "Driver binding"
+if [[ -d "$SYS_ROOT/module/sunxi_nand" ]]; then
+	echo "sunxi_nand module is loaded"
+else
+	echo "sunxi_nand module is not loaded"
+fi
+if [[ -d "$SYS_ROOT/bus/platform/drivers/sunxi_nand" ]]; then
+	find "$SYS_ROOT/bus/platform/drivers/sunxi_nand" -mindepth 1 -maxdepth 1 -type l \
+		-printf 'bound=%f\n' 2>/dev/null | sort
+else
+	echo "sunxi-nand platform driver is not registered"
+fi
 
 section "Kernel configuration"
 CONFIG_FILE="$BOOT_ROOT/config-$(uname -r)"
