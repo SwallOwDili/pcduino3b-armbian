@@ -133,11 +133,20 @@ sudo pcduino3b-selftest --iperf-server 192.168.1.2
 - `/proc/mtd` 没有设备，系统只有 `/dev/ubi_ctrl`，所以不存在可安全读取或写入的 raw MTD；
 - raw NAND/sunxi NAND 驱动是模块，UBI/UBIFS 为 built-in。
 
+2026-09-04 当前镜像的实机复测进一步确认：
+
+- 主机 `fdtoverlay` 预合成并直接选中的 recovery DTB 启动后网络不能保持在线；
+- 保留已验收的普通 DTB、改由 U-Boot 应用同一 recovery overlay 后，系统可正常进入 SSH，live DT 中 NAND 状态为 `okay`，GMAC 仍为 `rgmii-id`；
+- `modprobe.blacklist=sunxi_nand` 与 `/etc/modprobe.d` 黑名单均生效，启动期间没有自动探测；
+- 登录后显式执行 `modprobe sunxi_nand`，系统保持在线，并再次识别 Hynix `0xad:0xd7` 及 4 GiB/4 KiB/128 B/2 MiB 几何信息；
+- ONFI 参数页恢复仍失败，驱动返回 `-22`，`/proc/mtd` 为空；证据文件 `/root/pcduino3b-nand-probe-20260904.txt` 的 SHA-256 为 `8c8ca01a6bcb765e8ae54276b3f7b9b52cee05102c0e4a9f93e1c1462156dde7`。
+
 这证明启用控制器后，阻塞点会从“DT 节点未启用”推进到“NAND 参数/ECC 初始化失败”，但还不能据此确定唯一根因。recovery DTB 只复现经过观测的 CS0、RB0 和硬件 ECC 配置；它不声明 NAND 分区，也不包含 `nand-on-flash-bbt`，避免在几何与旧布局未知时创建持久化 BBT。普通 SD 镜像仍不受影响。
 
-`pcduino3b-nand-probe` 只安装到隔离的 NAND profile，普通 SD 镜像不携带 NAND 工具。用 NAND recovery 候选镜像启动后采集只读证据：
+`pcduino3b-nand-probe` 只安装到隔离的 NAND profile，普通 SD 镜像不携带 NAND 工具。快速 recovery 镜像保留已经实机验收的普通 DTB，由 U-Boot 在启动内存中应用 `pcduino3b-nand-recovery.dtbo`；不要安装由主机 `fdtoverlay` 预合成的 DTB。NAND recovery 默认禁止 udev 在启动期间自动加载 `sunxi_nand`，确保网络和 SSH 先进入可观察状态。登录后先确认系统稳定，再显式加载驱动并采集只读证据：
 
 ```bash
+sudo modprobe sunxi_nand
 sudo pcduino3b-nand-probe
 ```
 

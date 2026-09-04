@@ -25,7 +25,8 @@ else
 	echo "Build identity is unavailable"
 fi
 if [[ -r "$BOOT_ROOT/armbianEnv.txt" ]]; then
-	grep -E '^fdtfile=' "$BOOT_ROOT/armbianEnv.txt" || echo "fdtfile is not explicit"
+	grep -E '^(fdtfile|user_overlays)=' "$BOOT_ROOT/armbianEnv.txt" \
+		|| echo "fdtfile and user_overlays are not explicit"
 else
 	echo "Boot environment is unavailable"
 fi

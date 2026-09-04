@@ -101,38 +101,58 @@ jobs:
             exit 1
           }
           base_dtb=${base_dtbs[0]}
-          recovery_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-recovery.dtb"
-          fdtoverlay -i "$base_dtb" -o "$recovery_dtb" "$overlay"
+          verification_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-recovery-check.dtb"
+          fdtoverlay -i "$base_dtb" -o "$verification_dtb" "$overlay"
 
           base_nfc=/soc/nand-controller@1c03000
           recovery_nand=$base_nfc/nand@0
           [[ "$(fdtget -t s "$base_dtb" / model)" == 'LinkSprite pcDuino3B' ]]
           [[ "$(fdtget -t s "$base_dtb" "$base_nfc" status)" == disabled ]]
-          [[ "$(fdtget -t s "$recovery_dtb" / model)" == 'LinkSprite pcDuino3B' ]]
-          [[ "$(fdtget -t s "$recovery_dtb" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
-          [[ "$(fdtget -t s "$recovery_dtb" "$base_nfc" status)" == okay ]]
-          [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
-          [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
-          [[ "$(fdtget -t s "$recovery_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
-          if fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
+          [[ "$(fdtget -t s "$verification_dtb" / model)" == 'LinkSprite pcDuino3B' ]]
+          [[ "$(fdtget -t s "$verification_dtb" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
+          [[ "$(fdtget -t s "$verification_dtb" "$base_nfc" status)" == okay ]]
+          [[ "$(fdtget -t x "$verification_dtb" "$recovery_nand" reg)" == 0 ]]
+          [[ "$(fdtget -t x "$verification_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
+          [[ "$(fdtget -t s "$verification_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
+          if fdtget -p "$verification_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
             echo 'Recovery DTB must not enable persistent on-flash BBT' >&2
             exit 1
           fi
-          if fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions; then
+          if fdtget -l "$verification_dtb" "$recovery_nand" | grep -qx partitions; then
             echo 'Recovery DTB must not declare a partition map' >&2
             exit 1
           fi
 
-          recovery_dtb_target="$(dirname "$base_dtb")/sun7i-a20-pcduino3b-nand-recovery.dtb"
-          sudo install -m 0644 "$recovery_dtb" "$recovery_dtb_target"
+          # Keep the physically accepted base DTB on disk.  Applying the
+          # overlay in U-Boot was validated on hardware; installing a DTB
+          # pre-flattened by the host fdtoverlay tool was not bootable.
+          overlay_target="$mount_dir/boot/overlay-user/pcduino3b-nand-recovery.dtbo"
+          sudo install -D -m 0644 "$overlay" "$overlay_target"
           sudo install -m 0755 \
             userpatches/overlay/usr/local/sbin/pcduino3b-nand-probe \
             "$mount_dir/usr/local/sbin/pcduino3b-nand-probe"
 
           boot_env="$mount_dir/boot/armbianEnv.txt"
           sudo sed -i \
-            's|^fdtfile=.*$|fdtfile=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb|' \
+            's|^fdtfile=.*$|fdtfile=allwinner/sun7i-a20-pcduino3b.dtb|' \
             "$boot_env"
+          sudo sed -i '/^user_overlays=/d' "$boot_env"
+          printf '%s\n' 'user_overlays=pcduino3b-nand-recovery' \
+            | sudo tee -a "$boot_env" >/dev/null
+          # Do not let udev probe the experimental NAND driver during boot.
+          # The board must first reach the network; an operator can then load
+          # sunxi_nand explicitly while watching the resulting kernel log.
+          if sudo grep -q '^extraargs=' "$boot_env"; then
+            sudo sed -i \
+              '/^extraargs=/ s/$/ modprobe.blacklist=sunxi_nand/' \
+              "$boot_env"
+          else
+            printf '%s\n' 'extraargs=modprobe.blacklist=sunxi_nand' \
+              | sudo tee -a "$boot_env" >/dev/null
+          fi
+          sudo install -d -m 0755 "$mount_dir/etc/modprobe.d"
+          printf '%s\n' 'blacklist sunxi_nand' \
+            | sudo tee "$mount_dir/etc/modprobe.d/pcduino3b-nand-recovery.conf" >/dev/null
           build_info="$mount_dir/etc/pcduino3b-build-info"
           sudo sed -i 's/^IMAGE_PROFILE=.*$/IMAGE_PROFILE=nand-recovery/' "$build_info"
           printf '%s\n' \
@@ -142,10 +162,18 @@ jobs:
             | sudo tee "$mount_dir/etc/pcduino3b-nand-recovery-source" >/dev/null
 
           sudo grep -Fxq \
-            'fdtfile=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb' "$boot_env"
+            'fdtfile=allwinner/sun7i-a20-pcduino3b.dtb' "$boot_env"
+          sudo grep -Fxq \
+            'user_overlays=pcduino3b-nand-recovery' "$boot_env"
+          sudo grep -Eq \
+            '^extraargs=.*modprobe\.blacklist=sunxi_nand([[:space:]]|$)' \
+            "$boot_env"
+          sudo grep -Fxq 'blacklist sunxi_nand' \
+            "$mount_dir/etc/modprobe.d/pcduino3b-nand-recovery.conf"
           sudo grep -Fxq 'IMAGE_PROFILE=nand-recovery' "$build_info"
           sudo test -x "$mount_dir/usr/local/sbin/pcduino3b-nand-probe"
-          sudo fdtget -t s "$recovery_dtb_target" "$base_nfc" status | grep -qx okay
+          sudo cmp "$overlay" "$overlay_target"
+          fdtget -t s "$verification_dtb" "$base_nfc" status | grep -qx okay
 
           sync
           sudo umount "$mount_dir"
@@ -216,7 +244,9 @@ jobs:
             echo "- Source release: \`$BASE_RELEASE_TAG\`"
             echo "- Source SHA-256: \`$BASE_IMAGE_SHA256\`"
             echo '- Kernel rebuild: **not run**'
-            echo '- Added payload: isolated NAND recovery DTB and read-only evidence collector'
+            echo '- Added payload: U-Boot-applied NAND recovery overlay and read-only evidence collector'
+            echo '- On-disk DTB: physically accepted pcDuino3B base DTB'
+            echo '- Driver autoload: **blocked until explicit operator probe**'
             echo '- NAND partition map: **none**'
             echo '- Persistent on-flash BBT: **disabled**'
             echo '- NAND erase/write: **not authorized**'

@@ -18,7 +18,10 @@ fi
 mkdir -p "$TEST_ROOT/proc" "$TEST_ROOT/dev" "$TEST_ROOT/sys" "$TEST_ROOT/boot" "$TEST_ROOT/etc"
 printf 'dev:    size   erasesize  name\n' >"$TEST_ROOT/proc/mtd"
 printf 'IMAGE_PROFILE=nand-recovery\n' >"$TEST_ROOT/etc/pcduino3b-build-info"
-printf 'fdtfile=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb\n' >"$TEST_ROOT/boot/armbianEnv.txt"
+printf '%s\n' \
+	'fdtfile=allwinner/sun7i-a20-pcduino3b.dtb' \
+	'user_overlays=pcduino3b-nand-recovery' \
+	>"$TEST_ROOT/boot/armbianEnv.txt"
 
 set +e
 OUTPUT="$(
@@ -37,7 +40,8 @@ set -e
 grep -Fq 'MODE=READ_ONLY' <<<"$OUTPUT"
 grep -Fq 'INSTALLER=NOT_AUTHORIZED' <<<"$OUTPUT"
 grep -Fq 'IMAGE_PROFILE=nand-recovery' <<<"$OUTPUT"
-grep -Fq 'fdtfile=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb' <<<"$OUTPUT"
+grep -Fq 'fdtfile=allwinner/sun7i-a20-pcduino3b.dtb' <<<"$OUTPUT"
+grep -Fq 'user_overlays=pcduino3b-nand-recovery' <<<"$OUTPUT"
 grep -Fq 'sunxi_nand module is not loaded' <<<"$OUTPUT"
 grep -Fq 'PROBE_STATUS=NOT_READY' <<<"$OUTPUT"
 
