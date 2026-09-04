@@ -502,8 +502,12 @@ jobs:
               compressed_image="${RAW_IMAGE}.zst"
               ;;
             release)
-              xz -T0 -6 "$RAW_IMAGE"
               compressed_image="${RAW_IMAGE}.xz"
+              # The image is created by the privileged Armbian container and
+              # may carry a group the runner user cannot preserve.  Stream to
+              # a runner-owned file so xz does not try to copy that metadata.
+              xz -T0 -6 --stdout "$RAW_IMAGE" > "$compressed_image"
+              rm -f "$RAW_IMAGE"
               ;;
           esac
           compression_seconds=$(( $(date +%s) - started ))
