@@ -9,6 +9,10 @@ FAIL=0
 WARN=0
 IPERF_SERVER=""
 RUN_APT=1
+PROC_DT_ROOT="${PCDUINO3B_PROC_DT_ROOT:-/proc/device-tree}"
+SYS_CLASS_NET="${PCDUINO3B_SYS_CLASS_NET:-/sys/class/net}"
+ETC_ROOT="${PCDUINO3B_ETC_ROOT:-/etc}"
+LOG_DIR="${PCDUINO3B_LOG_DIR:-/var/log}"
 
 while (($#)); do
 	case "$1" in
@@ -32,13 +36,14 @@ while (($#)); do
 	esac
 done
 
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+if [[ ${EUID:-$(id -u)} -ne 0 && "$ETC_ROOT" == /etc ]]; then
 	echo "Please run as root: sudo pcduino3b-selftest" >&2
 	exit 2
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="/var/log/pcduino3b-selftest-${STAMP}.log"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/pcduino3b-selftest-${STAMP}.log"
 exec > >(tee -a "$LOG") 2>&1
 
 pass() { PASS=$((PASS + 1)); printf '[PASS] %s\n' "$*"; }
@@ -53,13 +58,103 @@ run_info() {
 	"$@" || true
 }
 
+config_value() {
+	local file="$1"
+	local key="$2"
+	local value
+
+	value="$(awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file" 2>/dev/null || true)"
+	value="${value#\"}"
+	value="${value%\"}"
+	printf '%s' "$value"
+}
+
+is_wired_interface() {
+	local iface="$1"
+	local type=""
+
+	[[ -r "$SYS_CLASS_NET/$iface/type" ]] && type="$(<"$SYS_CLASS_NET/$iface/type")"
+	[[ "$iface" != "lo" && "$type" == "1" && ! -d "$SYS_CLASS_NET/$iface/wireless" ]]
+}
+
+detect_ethernet_interface() {
+	local iface
+
+	while IFS= read -r iface; do
+		if is_wired_interface "$iface"; then
+			printf '%s\n' "$iface"
+			return 0
+		fi
+	done < <(ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev" && (i + 1) <= NF) { print $(i + 1); break } }')
+
+	for iface_path in "$SYS_CLASS_NET"/*; do
+		[[ -e "$iface_path" || -L "$iface_path" ]] || continue
+		iface="$(basename "$iface_path")"
+		if is_wired_interface "$iface" && ethtool "$iface" >/dev/null 2>&1; then
+			printf '%s\n' "$iface"
+			return 0
+		fi
+	done
+	return 1
+}
+
 section "Identity"
-MODEL="$(tr -d '\0' </proc/device-tree/model 2>/dev/null || true)"
+MODEL="$(tr -d '\0' <"$PROC_DT_ROOT/model" 2>/dev/null || true)"
 echo "Device tree model: ${MODEL:-unknown}"
 echo "Kernel: $(uname -srvm)"
 echo "Machine: $(uname -m)"
-cat /etc/os-release 2>/dev/null || true
-cat /etc/pcduino3b-build-info 2>/dev/null || true
+cat "$ETC_ROOT/os-release" 2>/dev/null || true
+cat "$ETC_ROOT/pcduino3b-build-info" 2>/dev/null || true
+
+if [[ "$MODEL" == "LinkSprite pcDuino3B" ]]; then
+	pass "device tree model identifies LinkSprite pcDuino3B"
+else
+	fail "device tree model is '${MODEL:-unknown}', expected LinkSprite pcDuino3B"
+fi
+
+HOSTNAME_FILE="$(tr -d '[:space:]' <"$ETC_ROOT/hostname" 2>/dev/null || true)"
+RUNTIME_HOSTNAME="$(hostname 2>/dev/null || true)"
+STATIC_HOSTNAME="$(hostnamectl --static 2>/dev/null || true)"
+if [[ "$HOSTNAME_FILE" == "pcduino3b" ]]; then
+	pass "/etc/hostname is pcduino3b"
+else
+	fail "/etc/hostname is '${HOSTNAME_FILE:-unknown}', expected pcduino3b"
+fi
+if awk '$1 == "127.0.1.1" { for (i = 2; i <= NF; i++) if ($i == "pcduino3b") found = 1 } END { exit !found }' \
+	"$ETC_ROOT/hosts" 2>/dev/null; then
+	pass "/etc/hosts maps 127.0.1.1 to pcduino3b"
+else
+	fail "/etc/hosts does not map 127.0.1.1 to pcduino3b"
+fi
+if [[ "$RUNTIME_HOSTNAME" == "pcduino3b" ]]; then
+	pass "runtime hostname is pcduino3b"
+else
+	fail "runtime hostname is '${RUNTIME_HOSTNAME:-unknown}', expected pcduino3b"
+fi
+if [[ "$STATIC_HOSTNAME" == "pcduino3b" ]]; then
+	pass "hostnamectl static hostname is pcduino3b"
+else
+	fail "hostnamectl static hostname is '${STATIC_HOSTNAME:-unknown}', expected pcduino3b"
+fi
+
+ARMBIAN_BOARD="$(config_value "$ETC_ROOT/armbian-release" BOARD)"
+ARMBIAN_BOARD_NAME="$(config_value "$ETC_ROOT/armbian-release" BOARD_NAME)"
+BUILD_INFO_BOARD="$(config_value "$ETC_ROOT/pcduino3b-build-info" ARMBIAN_BOARD)"
+if [[ "$ARMBIAN_BOARD" == "pcduino3b" ]]; then
+	pass "/etc/armbian-release BOARD is pcduino3b"
+else
+	fail "/etc/armbian-release BOARD is '${ARMBIAN_BOARD:-unknown}', expected pcduino3b"
+fi
+if [[ "$ARMBIAN_BOARD_NAME" == "pcDuino3B" ]]; then
+	pass "/etc/armbian-release BOARD_NAME is pcDuino3B"
+else
+	fail "/etc/armbian-release BOARD_NAME is '${ARMBIAN_BOARD_NAME:-unknown}', expected pcDuino3B"
+fi
+if [[ "$BUILD_INFO_BOARD" == "pcduino3b" ]]; then
+	pass "/etc/pcduino3b-build-info ARMBIAN_BOARD is pcduino3b"
+else
+	fail "/etc/pcduino3b-build-info ARMBIAN_BOARD is '${BUILD_INFO_BOARD:-unknown}', expected pcduino3b"
+fi
 
 if [[ "$(dpkg --print-architecture 2>/dev/null || true)" == "armhf" ]]; then
 	pass "userspace architecture is armhf"
@@ -67,7 +162,7 @@ else
 	fail "userspace architecture is not armhf"
 fi
 
-if grep -q '^VERSION_CODENAME=noble$' /etc/os-release 2>/dev/null; then
+if grep -q '^VERSION_CODENAME=noble$' "$ETC_ROOT/os-release" 2>/dev/null; then
 	pass "Ubuntu userspace codename is noble"
 else
 	fail "Ubuntu userspace codename is not noble"
@@ -80,7 +175,7 @@ else
 fi
 
 section "Device tree / Gigabit Ethernet"
-PHY_MODE_FILE="$(find /proc/device-tree -type f -name phy-mode 2>/dev/null | head -n1 || true)"
+PHY_MODE_FILE="$(find -L "$PROC_DT_ROOT" -type f -name phy-mode 2>/dev/null | head -n1 || true)"
 if [[ -n "$PHY_MODE_FILE" ]]; then
 	PHY_MODE="$(tr -d '\0' <"$PHY_MODE_FILE" 2>/dev/null || true)"
 	echo "phy-mode file: $PHY_MODE_FILE"
@@ -94,14 +189,8 @@ else
 	fail "could not find a phy-mode property in the live device tree"
 fi
 
-IFACE="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
-if [[ -z "$IFACE" ]]; then
-	for p in /sys/class/net/*; do
-		n="$(basename "$p")"
-		[[ "$n" == "lo" ]] && continue
-		if ethtool "$n" >/dev/null 2>&1; then IFACE="$n"; break; fi
-	done
-fi
+IFACE="$(detect_ethernet_interface || true)"
+DMESG_NET="$(dmesg 2>/dev/null | grep -Ei 'sun7i-dwmac|stmmac|st_gmac|RTL821|Link is Up' | tail -n 80 || true)"
 
 if [[ -z "$IFACE" ]]; then
 	fail "no Ethernet interface detected"
@@ -109,7 +198,8 @@ else
 	echo "Ethernet interface: $IFACE"
 	run_info ip -details link show dev "$IFACE"
 	run_info ip address show dev "$IFACE"
-	run_info ethtool -i "$IFACE"
+	ETHTOOL_DRIVER_OUT="$(ethtool -i "$IFACE" 2>&1 || true)"
+	echo "$ETHTOOL_DRIVER_OUT"
 	ETHTOOL_OUT="$(ethtool "$IFACE" 2>&1 || true)"
 	echo "$ETHTOOL_OUT"
 
@@ -128,18 +218,31 @@ else
 		fail "Ethernet negotiated '${SPEED:-unknown}' '${DUPLEX:-unknown}', expected 1000Mb/s Full Duplex"
 	fi
 
-	PHY_DRIVER="$(basename "$(readlink -f "/sys/class/net/$IFACE/phydev/driver" 2>/dev/null)" 2>/dev/null || true)"
-	[[ -n "$PHY_DRIVER" ]] && echo "PHY driver: $PHY_DRIVER"
-	if [[ "$PHY_DRIVER" == "realtek" ]]; then
-		pass "Realtek PHY driver is bound"
+	PHY_PATH="$SYS_CLASS_NET/$IFACE/phydev"
+	PHY_DRIVER="$(basename "$(readlink -f "$PHY_PATH/driver" 2>/dev/null)" 2>/dev/null || true)"
+	if [[ -r "$PHY_PATH/name" ]]; then
+		PHY_NAME="$(tr -d '\0' <"$PHY_PATH/name")"
 	else
-		warn "PHY driver is '${PHY_DRIVER:-unknown}'; inspect dmesg for the actual PHY"
+		PHY_NAME=""
+	fi
+	PHY_UEVENT="$(cat "$PHY_PATH/uevent" 2>/dev/null || true)"
+	NIC_DRIVER="$(awk -F': ' '/^driver:/ { print $2; exit }' <<<"$ETHTOOL_DRIVER_OUT")"
+	[[ -n "$PHY_DRIVER" ]] && echo "PHY driver: $PHY_DRIVER"
+	[[ -n "$PHY_NAME" ]] && echo "PHY name: $PHY_NAME"
+	PHY_EVIDENCE="$PHY_DRIVER $PHY_NAME $PHY_UEVENT $ETHTOOL_DRIVER_OUT $ETHTOOL_OUT $DMESG_NET"
+	if grep -Eqi 'RTL8211(E|[A-Z0-9_-]*)?' <<<"$PHY_EVIDENCE"; then
+		pass "RTL8211E PHY is bound"
+	elif grep -Eqi '(^|[^[:alnum:]_])realtek([^[:alnum:]_]|$)' <<<"$PHY_EVIDENCE"; then
+		pass "Realtek PHY driver is bound"
+	elif [[ (-e "$PHY_PATH" || -L "$PHY_PATH") && "$NIC_DRIVER" =~ ^(st_gmac|stmmac|sun7i-dwmac)$ ]]; then
+		pass "PHY is bound normally through $NIC_DRIVER"
+	else
+		warn "could not confirm the PHY binding from sysfs, ethtool or dmesg"
 	fi
 fi
 
-DMESG_NET="$(dmesg 2>/dev/null | grep -Ei 'sun7i-dwmac|stmmac|RTL821|Link is Up' | tail -n 80 || true)"
 echo "$DMESG_NET"
-if grep -Eqi 'sun7i-dwmac|stmmac' <<<"$DMESG_NET"; then
+if grep -Eqi 'sun7i-dwmac|stmmac|st_gmac' <<<"$DMESG_NET"; then
 	pass "A20 STMMAC/DWMAC messages are present in dmesg"
 else
 	warn "no STMMAC/DWMAC messages found in the current dmesg buffer"

@@ -1,84 +1,81 @@
 # pcDuino3B Armbian
 
-面向 **LinkSprite pcDuino3B** 的可直接刷写 Armbian 镜像工程。镜像在 GitHub Actions 云端构建，使用 Ubuntu 24.04 Noble armhf 用户空间和 Armbian `current-sunxi` 内核线；不要求使用者在本地编译。
+面向 **LinkSprite pcDuino3B** 的独立 Armbian 镜像工程。正式镜像只由 GitHub Actions 构建，固定使用 Ubuntu 24.04 Noble、armhf 和 Armbian `current-sunxi` Linux 6.18.49 基线。
 
-## 下载
+机器可读板型统一为 `pcduino3b`，默认主机名为 `pcduino3b`，设备树模型为 `LinkSprite pcDuino3B`。Release 镜像文件名必须包含 `Pcduino3b`。
 
-打开本仓库 **Releases**，下载 `pcduino3b-noble-current` 发行版中的 `*.img.xz`。
+## 下载与安装
 
-完整刷机、首次启动、千兆网口验收和排障步骤见：[docs/INSTALL.md](docs/INSTALL.md)。
+从仓库的 **Releases** 下载已经通过镜像验收的 `*_Pcduino3b_*.img.xz` 及对应 SHA-256 文件。刷写、首次启动和实体板验收见 [安装文档](docs/INSTALL.md)。
 
-## pcDuino3B 的关键适配
+候选镜像先作为 pre-release 上传；实体板验证的必须是该候选文件本身及其 SHA-256。正式发布只提升同一候选 Release，不重新构建或压缩。
 
-pcDuino3B 与原 pcDuino3 的关键差异是千兆以太网。上游 `sun7i-a20-pcduino3.dts` 描述的是原版 pcDuino3 的 MII/100M 接法，因此本项目在 Armbian 内核构建时应用 3B 专用补丁：
+## 独立板型与千兆网适配
+
+本项目通过 `userpatches/config/boards/pcduino3b.csc` 注册独立板型，并生成、加载 `sun7i-a20-pcduino3b.dtb`。原版板型的设备树保持不变。
+
+pcDuino3B 专用设备树以其上游 A20 板级定义为兼容基础，只表达已经过实体板验证的差异：
 
 ```dts
+/ {
+    model = "LinkSprite pcDuino3B";
+};
+
 &gmac {
-    pinctrl-names = "default";
     pinctrl-0 = <&gmac_rgmii_pins>;
-    phy-handle = <&phy1>;
     phy-mode = "rgmii-id";
-    status = "okay";
 };
 ```
 
-同时强制把以下驱动编入内核，而不是依赖模块自动加载：
+内核配置保证 `STMMAC_ETH`、`STMMAC_PLATFORM`、`DWMAC_SUNXI` 和 `REALTEK_PHY` 可用。实体板基线为 `end0`、`st_gmac`、RTL8211E、1000Mb/s Full Duplex。
 
-```text
-CONFIG_STMMAC_ETH=y
-CONFIG_STMMAC_PLATFORM=y
-CONFIG_DWMAC_SUNXI=y
-CONFIG_REALTEK_PHY=y
-```
+`Linksprite_pcDuino3_defconfig`、`sun7i-a20-pcduino3.dts` 和 `linksprite,pcduino3` 仅作为 U-Boot、Linux 设备树的底层兼容实现；它们不得成为镜像 hostname、Armbian `BOARD`、DT model、镜像名或 Release 产品名。
 
-## 发布前自动验证
+## 构建层次
 
-GitHub Actions 分为两层：
+- **Fast preflight**：语法、板型解析、DTS/DTB、身份 lint、自检夹具和 NAND 只读安全检查，不生成 rootfs 或镜像。
+- **Image build**：显式选择 `dev`、`sd-release`、`nand-installer` 或 `nand-recovery` profile；软件包由 `packages/common.txt` 与对应 profile 清单统一汇总。
+- **Release promotion**：只提升已上传、已记录 SHA-256、已在实体板验证的候选文件。
 
-1. **Static preflight**：对 Linux v6.18 上游 DTS 实际执行 `git apply --check`，并校验定制脚本。
-2. **Cloud build and image acceptance**：使用固定的 Armbian build commit 完整编译，然后挂载生成的 `.img`，反编译镜像内 DTB，检查 Noble rootfs、内核配置、`rgmii-id` 和自检脚本。镜像构建过程中还会执行 `apt-get update` 和 Ubuntu ARM archive HTTPS 探测。
+普通 README/文档修改不触发完整镜像构建。历史构建性能与每轮应记录的数据见 [BUILD-PERFORMANCE.md](BUILD-PERFORMANCE.md)。
 
-发行版先以 pre-release 创建；只有 post-build acceptance 全部通过后，工作流才会上传 `CI-VERIFICATION.txt` 并提升为正式 release。
+## 镜像 profile
 
-## 板端最终验收
+| Profile | 用途 | rootfs/压缩策略 |
+| --- | --- | --- |
+| `dev` | 快速网络、身份和板级验证 | Minimal；快速产物；不创建正式 Release |
+| `sd-release` | 日常 microSD 系统 | 完整验收；xz；SHA-256 |
+| `nand-installer` | 4GiB NAND 安装研究入口 | Minimal；当前仅接口和只读诊断，不具备写入授权 |
+| `nand-recovery` | NAND 备份、恢复研究入口 | Minimal；当前仅接口和只读诊断，不具备写入授权 |
 
-CI 没有真实的 pcDuino3B 物理 RJ45 端口，因此不会虚构“硬件已跑到 1000M”。实际板子启动后执行：
+NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`pcduino3b-nand-rootfs` 和 `pcduino3b-nand-layout`。NAND 实验不进入普通 `sd-release` 镜像路径。
+
+2026-09-04 对实体板上的旧测试镜像做了只读探测：live DT 已将 NFC/NAND 节点设为 `okay`，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出；因此 `/proc/mtd` 仍为空，仅存在 `/dev/ubi_ctrl`。这套实验性 DT 启用尚未进入本仓库的普通 `sd-release`。NAND profile 中的 `sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`，仓库不提供可写安装器。
+
+## 板端验收
 
 ```bash
 sudo pcduino3b-selftest
 ```
 
-脚本会检查实时 Device Tree、GMAC/PHY 驱动、`ethtool` 链路速率/双工、默认路由、DNS、Ubuntu Noble HTTPS、`apt-get update`、SATA/USB/MMC、SSH、NTP 和 systemd 状态。
-
-接入千兆交换机/路由器及合格 Cat5e/Cat6 网线时，核心验收项应为：
+自检自动选择默认路由对应的有线接口（实机为 `end0`），检查四处身份、live DT、RTL8211E/Realtek PHY 绑定、千兆全双工、DNS、Ubuntu Noble HTTPS、APT、SATA、USB、I2C、SSH 和 NTP。核心结果应包括：
 
 ```text
+[PASS] device tree model identifies LinkSprite pcDuino3B
+[PASS] GMAC device tree uses rgmii-id
+[PASS] RTL8211E PHY is bound
 [PASS] Ethernet negotiated 1000Mb/s Full Duplex
 ```
 
-如局域网有另一台运行 `iperf3 -s` 的主机，还可以执行：
+## 固定基线
 
-```bash
-sudo pcduino3b-selftest --iperf-server <服务器IP>
-```
+- Board target：`pcduino3b`
+- SoC family：Allwinner A20 / `sun7i`
+- Architecture：`armhf`
+- Userspace：Ubuntu 24.04 Noble
+- Kernel：Armbian `current-sunxi` Linux 6.18.49
+- Armbian build framework：`34e66c37211c70ef5cfad9c80dd76389720e19b7`
 
-## 构建基线
+板型配置同时暴露 `legacy` 6.12、`current` 6.18、`edge` 7.1 三条内核线，并分别携带同源的专用 DT 补丁；自动发布基线只使用经过完整镜像验收的 `current` 6.18.49。
 
-- Board target: Armbian `pcduino3`
-- SoC family: Allwinner A20 / `sun7i`
-- Architecture: `armhf`
-- Userspace: Ubuntu 24.04 Noble
-- Kernel: Armbian `current`, pinned build framework currently selects Linux 6.18.y
-- Armbian build framework pin: `34e66c37211c70ef5cfad9c80dd76389720e19b7`
-- Output: raw `.img` + compressed `.img.xz` + checksums + CI verification report
-
-## 目录
-
-```text
-.github/workflows/build.yml
-userpatches/kernel/archive/sunxi-6.18/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch
-userpatches/extensions/pcduino3b-gigabit.sh
-userpatches/customize-image.sh
-userpatches/overlay/usr/local/sbin/pcduino3b-selftest
-docs/INSTALL.md
-```
+身份引用的逐项分类和允许边界见 [身份审计](docs/IDENTITY-AUDIT.md)。

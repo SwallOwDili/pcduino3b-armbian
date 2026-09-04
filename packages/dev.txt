@@ -1,0 +1,5 @@
+# Fast developer image: networking and basic board diagnostics only.
+i2c-tools
+iperf3
+iproute2
+usbutils

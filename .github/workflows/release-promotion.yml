@@ -1,0 +1,154 @@
+name: pcDuino3B release promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Existing candidate prerelease tag
+        required: true
+        type: string
+      tested_sha256:
+        description: SHA-256 physically tested on the pcDuino3B
+        required: true
+        type: string
+      hardware_acceptance:
+        description: Physical board test result
+        required: true
+        type: choice
+        default: pending
+        options:
+          - pending
+          - pass
+          - fail
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pcduino3b-release-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Verify tested bytes and promote
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Verify candidate evidence
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          TESTED_SHA256: ${{ inputs.tested_sha256 }}
+          HARDWARE_ACCEPTANCE: ${{ inputs.hardware_acceptance }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_TAG" =~ ^pcduino3b-(sd-release|nand-installer|nand-recovery)-candidate-[0-9]+$ ]] || {
+            echo 'candidate_tag is not a pcDuino3B candidate tag produced by image-build' >&2
+            exit 1
+          }
+          [[ "$TESTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'tested_sha256 must contain exactly 64 hexadecimal characters' >&2
+            exit 1
+          }
+
+          release_json=$(gh release view "$CANDIDATE_TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --json tagName,isPrerelease,url,assets)
+          jq -e '.isPrerelease == true' <<< "$release_json" >/dev/null || {
+            echo 'Candidate is not an existing prerelease' >&2
+            exit 1
+          }
+
+          evidence_dir="$RUNNER_TEMP/release-evidence"
+          mkdir -p "$evidence_dir"
+          gh release download "$CANDIDATE_TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --dir "$evidence_dir" \
+            --pattern '*.sha'
+          gh release download "$CANDIDATE_TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --dir "$evidence_dir" \
+            --pattern 'CI-VERIFICATION-*.txt'
+
+          mapfile -t sha_files < <(find "$evidence_dir" -maxdepth 1 -type f -name '*.sha' | sort)
+          mapfile -t reports < <(find "$evidence_dir" -maxdepth 1 -type f -name 'CI-VERIFICATION-*.txt' | sort)
+          ((${#sha_files[@]} == 1 && ${#reports[@]} == 1)) || {
+            echo 'Candidate must contain exactly one checksum and one verification report' >&2
+            exit 1
+          }
+          grep -qx 'BUILD=PASS' "${reports[0]}"
+          grep -qx 'IMAGE_ACCEPTANCE=PASS' "${reports[0]}"
+          grep -qx 'RELEASE_UPLOAD=PASS' "${reports[0]}"
+          grep -qx 'HARDWARE_ACCEPTANCE=PENDING' "${reports[0]}"
+
+          candidate_sha=$(awk 'NR == 1 { print $1 }' "${sha_files[0]}")
+          [[ "${candidate_sha,,}" == "${TESTED_SHA256,,}" ]] || {
+            echo "Hardware-tested SHA-256 does not match candidate: $candidate_sha" >&2
+            exit 1
+          }
+          image_name=$(awk 'NR == 1 { print $2 }' "${sha_files[0]}")
+          image_name="${image_name#\*}"
+          jq -e --arg name "$image_name" '.assets | any(.name == $name)' \
+            <<< "$release_json" >/dev/null || {
+            echo "Checksum names missing release asset: $image_name" >&2
+            exit 1
+          }
+
+          {
+            echo "candidate_sha=$candidate_sha"
+            echo "image_name=$image_name"
+            echo "release_url=$(jq -r .url <<< "$release_json")"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$HARDWARE_ACCEPTANCE" != pass ]]; then
+            echo "Release left as prerelease because hardware_acceptance=$HARDWARE_ACCEPTANCE"
+          fi
+
+      - name: Promote the same candidate bytes
+        id: promotion
+        if: inputs.hardware_acceptance == 'pass'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "${{ inputs.candidate_tag }}" \
+            -R "$GITHUB_REPOSITORY" \
+            --prerelease=false \
+            --latest
+
+      - name: Promotion summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.verify.outcome }}' == success ]]; then
+            evidence_status=PASS
+          else
+            evidence_status=FAIL
+          fi
+          if [[ '${{ inputs.hardware_acceptance }}' == pass && '${{ steps.promotion.outcome }}' == success ]]; then
+            release_status=PASS
+          elif [[ '${{ inputs.hardware_acceptance }}' == fail ]]; then
+            release_status=NOT_PROMOTED
+          else
+            release_status=PENDING
+          fi
+          {
+            echo '## pcDuino3B release promotion'
+            echo
+            echo '| Gate | Status |'
+            echo '|---|---|'
+            echo "| BUILD | $evidence_status |"
+            echo "| IMAGE_ACCEPTANCE | $evidence_status |"
+            echo "| RELEASE_UPLOAD | $evidence_status |"
+            echo "| HARDWARE_ACCEPTANCE | ${{ inputs.hardware_acceptance }} |" | tr '[:lower:]' '[:upper:]'
+            echo "| PROMOTION | $release_status |"
+            echo
+            echo "- Candidate tag: \`${{ inputs.candidate_tag }}\`"
+            echo "- Tested image: \`${{ steps.verify.outputs.image_name || 'unverified' }}\`"
+            echo "- Tested SHA-256: \`${{ steps.verify.outputs.candidate_sha || inputs.tested_sha256 }}\`"
+            echo '- Rebuild: **not run**'
+            echo '- Recompression: **not run**'
+          } >> "$GITHUB_STEP_SUMMARY"
