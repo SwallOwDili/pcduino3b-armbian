@@ -1,0 +1,6 @@
+# Required by every pcDuino3B image profile.
+ca-certificates
+curl
+dnsutils
+ethtool
+openssh-server

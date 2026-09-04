@@ -1,6 +1,15 @@
 # pcDuino3B Gigabit Ethernet kernel guarantees.
 # Keep this file function-only: Armbian sources extension files into its build shell.
 
+function extension_prepare_config__pcduino3b_profile_suffix() {
+	case "${PCDUINO3B_IMAGE_PROFILE:-}" in
+		nand-installer | nand-recovery)
+			# Keep experimental NAND artifacts unmistakably separate from SD images.
+			EXTRA_IMAGE_SUFFIXES+=("-${PCDUINO3B_IMAGE_PROFILE}")
+			;;
+	esac
+}
+
 function custom_kernel_config__pcduino3b_gigabit_ethernet() {
 	# Changing any of these options must invalidate Armbian's kernel-config cache.
 	kernel_config_modifying_hashes+=(

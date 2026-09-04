@@ -1,0 +1,12 @@
+# Minimal NAND recovery, backup and offline diagnosis toolbox.
+busybox-static
+e2fsprogs
+gzip
+mtd-utils
+rsync
+smartmontools
+u-boot-tools
+usbutils
+util-linux
+xz-utils
+zstd

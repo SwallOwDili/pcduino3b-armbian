@@ -1,0 +1,8 @@
+# Minimal, non-destructive-by-default NAND installer toolbox.
+dosfstools
+e2fsprogs
+mtd-utils
+parted
+rsync
+u-boot-tools
+util-linux
