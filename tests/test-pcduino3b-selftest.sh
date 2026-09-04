@@ -109,4 +109,20 @@ grep -Fq '[PASS] RTL8211E PHY is bound' "$OUTPUT"
 grep -Fq '[PASS] Ethernet negotiated 1000Mb/s Full Duplex' "$OUTPUT"
 grep -Fq 'FAIL=0' "$OUTPUT"
 
+rm "$TEST_ROOT/sys/class/net/end0/phydev/name"
+OUTPUT_WITHOUT_PHY_NAME="$TEST_ROOT/output-without-phy-name.txt"
+PATH="$TEST_ROOT/bin:$PATH" \
+	PCDUINO3B_PROC_DT_ROOT="$TEST_ROOT/proc/device-tree" \
+	PCDUINO3B_SYS_CLASS_NET="$TEST_ROOT/sys/class/net" \
+	PCDUINO3B_ETC_ROOT="$TEST_ROOT/etc" \
+	PCDUINO3B_LOG_DIR="$TEST_ROOT/log" \
+	bash "$SELFTEST" --skip-apt >"$OUTPUT_WITHOUT_PHY_NAME" 2>&1
+
+grep -Fq '[PASS] RTL8211E PHY is bound' "$OUTPUT_WITHOUT_PHY_NAME"
+grep -Fq 'FAIL=0' "$OUTPUT_WITHOUT_PHY_NAME"
+if grep -Fq 'No such file or directory' "$OUTPUT_WITHOUT_PHY_NAME"; then
+	echo 'selftest emitted a missing PHY name error' >&2
+	exit 1
+fi
+
 echo 'pcduino3b-selftest fixture: PASS'

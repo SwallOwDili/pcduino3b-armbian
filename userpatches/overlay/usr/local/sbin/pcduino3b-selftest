@@ -220,7 +220,11 @@ else
 
 	PHY_PATH="$SYS_CLASS_NET/$IFACE/phydev"
 	PHY_DRIVER="$(basename "$(readlink -f "$PHY_PATH/driver" 2>/dev/null)" 2>/dev/null || true)"
-	PHY_NAME="$(tr -d '\0' <"$PHY_PATH/name" 2>/dev/null || true)"
+	if [[ -r "$PHY_PATH/name" ]]; then
+		PHY_NAME="$(tr -d '\0' <"$PHY_PATH/name")"
+	else
+		PHY_NAME=""
+	fi
 	PHY_UEVENT="$(cat "$PHY_PATH/uevent" 2>/dev/null || true)"
 	NIC_DRIVER="$(awk -F': ' '/^driver:/ { print $2; exit }' <<<"$ETHTOOL_DRIVER_OUT")"
 	[[ -n "$PHY_DRIVER" ]] && echo "PHY driver: $PHY_DRIVER"
