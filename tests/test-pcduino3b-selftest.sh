@@ -90,7 +90,7 @@ MOCK
 for command_name in apt-get curl df findmnt free getent lscpu lsblk lsusb uptime; do
 	ln -s /usr/bin/true "$TEST_ROOT/bin/$command_name"
 done
-chmod +x "$TEST_ROOT/bin"/*
+find "$TEST_ROOT/bin" -type f -exec chmod +x {} +
 
 OUTPUT="$TEST_ROOT/output.txt"
 PATH="$TEST_ROOT/bin:$PATH" \
