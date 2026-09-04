@@ -125,7 +125,17 @@ sudo pcduino3b-selftest --iperf-server 192.168.1.2
 
 `nand-installer` 与 `nand-recovery` 是隔离的 Minimal profile 接口，不是已授权的写入工具。普通 `sd-release` 不包含 NAND 实验流程。
 
-当前已知实机状态：`/proc/mtd` 为空，仅有 `/dev/ubi_ctrl`，live DT 的 NFC 节点为 disabled；内核的 raw NAND/sunxi NAND 驱动是模块，UBI/UBIFS 为 built-in。`pcduino3b-nand-probe` 只安装到隔离的 NAND profile，普通 SD 镜像不携带 NAND 工具。用 NAND recovery 候选镜像启动后采集只读证据：
+2026-09-04 实体板旧测试镜像的只读基线如下：
+
+- live DT 中 `/soc/nand-controller@1c03000` 及 `nand@0` 的状态为 `okay`，片选和 ready/busy 均为 0，ECC mode 为 `hw`；
+- 内核读到 Hynix `0xad:0xd7`，容量 4096 MiB、erase block 2048 KiB、page 4096 B、OOB 128 B；
+- ONFI parameter page 的多数恢复失败，随后 `sunxi_nand` 初始化失败并返回 `-22`；
+- `/proc/mtd` 没有设备，系统只有 `/dev/ubi_ctrl`，所以不存在可安全读取或写入的 raw MTD；
+- raw NAND/sunxi NAND 驱动是模块，UBI/UBIFS 为 built-in。
+
+这证明当前阻塞点已从“DT 节点未启用”推进到“NAND 参数/ECC 初始化失败”，但还不能据此确定唯一根因。旧测试镜像中的实验性 NAND DT 配置尚未纳入本仓库的普通 `sd-release`，不能把这次探测视为标准镜像已具备 NAND 支持。
+
+`pcduino3b-nand-probe` 只安装到隔离的 NAND profile，普通 SD 镜像不携带 NAND 工具。用 NAND recovery 候选镜像启动后采集只读证据：
 
 ```bash
 sudo pcduino3b-nand-probe

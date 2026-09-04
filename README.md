@@ -50,7 +50,7 @@ pcDuino3B 专用设备树以其上游 A20 板级定义为兼容基础，只表�
 
 NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`pcduino3b-nand-rootfs` 和 `pcduino3b-nand-layout`。NAND 实验不进入普通 `sd-release` 镜像路径。
 
-当前实体板 `/proc/mtd` 为空，仅存在 `/dev/ubi_ctrl`，live DT 的 NFC 节点为 disabled。NAND profile 中的 `sudo pcduino3b-nand-probe` 只采集现状，普通 SD profile 不安装它；在芯片几何、ECC、坏块和完整备份得到验证前，输出会保持 `INSTALLER=NOT_AUTHORIZED`，仓库不提供可写安装器。
+2026-09-04 对实体板上的旧测试镜像做了只读探测：live DT 已将 NFC/NAND 节点设为 `okay`，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出；因此 `/proc/mtd` 仍为空，仅存在 `/dev/ubi_ctrl`。这套实验性 DT 启用尚未进入本仓库的普通 `sd-release`。NAND profile 中的 `sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`，仓库不提供可写安装器。
 
 ## 板端验收
 
