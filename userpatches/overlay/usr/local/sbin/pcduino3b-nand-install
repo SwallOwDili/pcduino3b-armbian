@@ -12,6 +12,9 @@ BACKUP_SHA256=
 HOST_BACKUP_CONFIRMED=no
 MOUNT_DIR=
 ATTACHED_MTD=
+LOCK_DIR=/run/pcduino3b
+LOCK_FILE=$LOCK_DIR/nand-install.lock
+LOCK_FD=
 
 usage() {
 	cat <<'USAGE'
@@ -44,6 +47,7 @@ find_mtd_by_label() {
 	local expected="$1" path label found=
 	for path in /sys/class/mtd/mtd[0-9]*; do
 		[[ -d "$path" ]] || continue
+		[[ "${path##*/}" =~ ^mtd[0-9]+$ ]] || continue
 		label="$(read_one_line "$path/name")"
 		[[ "$label" == "$expected" ]] || continue
 		[[ -z "$found" ]] || die "duplicate MTD partition label: $expected"
@@ -58,10 +62,42 @@ sysfs_value() {
 	read_one_line "/sys/class/mtd/$device_name/$2"
 }
 
+bad_block_count() {
+	local device="$1" value
+	value="$(sysfs_value "$device" bad_blocks)"
+	[[ "$value" =~ ^[0-9]+$ ]] || \
+		die "invalid bad-block count for $device: $value"
+	printf '%s\n' "$value"
+}
+
+mtd_flags() {
+	local device="$1" value
+	value="$(sysfs_value "$device" flags)"
+	[[ "$value" =~ ^0x[0-9a-fA-F]+$ ]] || \
+		die "invalid MTD flags for $device: $value"
+	printf '%s\n' "$value"
+}
+
 expect_value() {
 	local actual="$1" expected="$2" description="$3"
 	[[ "$actual" == "$expected" ]] || \
 		die "$description mismatch: got '$actual', expected '$expected'"
+}
+
+checksum_entry_count() {
+	local checksum_file="$1" expected_name="$2"
+	awk -v expected="$expected_name" '
+		{
+			digest = $1
+			if (length(digest) != 64 || digest ~ /[^[:xdigit:]]/)
+				next
+			name = $0
+			sub(/^[^[:space:]]+[[:space:]][ *]?/, "", name)
+			if (name == expected)
+				count++
+		}
+		END { print count + 0 }
+	' "$checksum_file"
 }
 
 cleanup() {
@@ -72,7 +108,26 @@ cleanup() {
 	if [[ -n "$ATTACHED_MTD" ]]; then
 		ubidetach /dev/ubi_ctrl -m "$ATTACHED_MTD" >/dev/null 2>&1
 	fi
+	if [[ -n "$MOUNT_DIR" ]]; then
+		rm -f -- "$MOUNT_DIR/boot.itb" "$MOUNT_DIR/spl-backup.raw" \
+			"$MOUNT_DIR/spl-primary.raw" "$MOUNT_DIR/uboot.bin"
+	fi
 	[[ -n "$MOUNT_DIR" ]] && rmdir "$MOUNT_DIR" 2>/dev/null
+}
+
+exit_with_cleanup() {
+	local status=$?
+	trap - EXIT INT TERM
+	cleanup
+	exit "$status"
+}
+
+abort_on_signal() {
+	local signal="$1" status="$2"
+	trap - EXIT INT TERM
+	echo "ERROR: interrupted by $signal; no later NAND phase will run" >&2
+	cleanup
+	exit "$status"
 }
 
 while (($#)); do
@@ -117,15 +172,19 @@ done
 # shellcheck disable=SC1091
 source "$LAYOUT_FILE"
 
-need_command findmnt
-need_command flash_erase
-need_command nanddump
-need_command nandwrite
-need_command sha256sum
-need_command ubiattach
-need_command ubidetach
-need_command ubiformat
-need_command ubinfo
+for command_name in \
+	awk cat cmp date dmesg dumpimage findmnt flash_erase flock grep install \
+	mount mountpoint mktemp nanddump nandwrite readlink rm rmdir sha256sum \
+	sleep stat sync tee tr ubiattach ubidetach ubiformat ubinfo umount; do
+	need_command "$command_name"
+done
+
+[[ ! -L "$LOCK_DIR" ]] || die "installer lock directory is a symlink: $LOCK_DIR"
+install -d -m 0755 -o root -g root "$LOCK_DIR"
+expect_value "$(stat -c %u:%g "$LOCK_DIR")" 0:0 'installer lock directory owner'
+expect_value "$(stat -c %a "$LOCK_DIR")" 755 'installer lock directory mode'
+exec {LOCK_FD}>"$LOCK_FILE"
+flock -n "$LOCK_FD" || die 'another pcduino3b NAND installer is already running'
 
 MODEL="$(read_one_line /proc/device-tree/model)"
 expect_value "$MODEL" 'LinkSprite pcDuino3B' 'device-tree model'
@@ -143,7 +202,43 @@ grep -Fq 'H27UBG8T2CTR-BC' /proc/mtd /var/log/kern.log 2>/dev/null || \
 SPL_PRIMARY_DEV="$(find_mtd_by_label spl-primary)"
 SPL_BACKUP_DEV="$(find_mtd_by_label spl-backup)"
 UBOOT_DEV="$(find_mtd_by_label uboot)"
-UBI_DEV="$(find_mtd_by_label ubi)"
+BOOTFIT_DEV="$(find_mtd_by_label bootfit)"
+ROOTFS_DEV="$(find_mtd_by_label rootfs)"
+
+for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" \
+	"$BOOTFIT_DEV" "$ROOTFS_DEV"; do
+	[[ -c "$device" ]] || die "MTD character device is missing: $device"
+done
+[[ -c /dev/ubi_ctrl ]] || die 'UBI control device is missing'
+
+expect_value "$(sysfs_value "$SPL_PRIMARY_DEV" offset)" \
+	"$PCDUINO3B_NAND_SPL_PRIMARY_OFFSET" 'primary SPL partition offset'
+expect_value "$(sysfs_value "$SPL_BACKUP_DEV" offset)" \
+	"$PCDUINO3B_NAND_SPL_BACKUP_OFFSET" 'backup SPL partition offset'
+expect_value "$(sysfs_value "$UBOOT_DEV" offset)" \
+	"$PCDUINO3B_NAND_UBOOT_OFFSET" 'U-Boot partition offset'
+expect_value "$(sysfs_value "$BOOTFIT_DEV" offset)" \
+	"$PCDUINO3B_NAND_BOOTFIT_OFFSET" 'boot FIT partition offset'
+expect_value "$(sysfs_value "$ROOTFS_DEV" offset)" \
+	"$PCDUINO3B_NAND_ROOTFS_OFFSET" 'rootfs partition offset'
+
+NAND_CONTROLLER="$(readlink -f "/sys/class/mtd/${SPL_PRIMARY_DEV#/dev/}/device")"
+[[ -n "$NAND_CONTROLLER" ]] || die 'cannot resolve the NAND controller device'
+for device in "$SPL_BACKUP_DEV" "$UBOOT_DEV" "$BOOTFIT_DEV" "$ROOTFS_DEV"; do
+	expect_value "$(readlink -f "/sys/class/mtd/${device#/dev/}/device")" \
+		"$NAND_CONTROLLER" "$device NAND controller"
+done
+
+for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" \
+	"$BOOTFIT_DEV" "$ROOTFS_DEV"; do
+	DEVICE_FLAGS="$(mtd_flags "$device")"
+	((DEVICE_FLAGS & 0x400)) || die "$device is not writable; refusing before erase"
+done
+ROOTFS_TYPE="$(sysfs_value "$ROOTFS_DEV" type)"
+ROOTFS_FLAGS="$(mtd_flags "$ROOTFS_DEV")"
+expect_value "$ROOTFS_TYPE" mlc-nand 'rootfs MTD type'
+((ROOTFS_FLAGS & 0x4000)) || \
+	die 'rootfs is raw MLC NAND without SLC emulation; refusing before erase'
 
 expect_value "$(sysfs_value "$SPL_PRIMARY_DEV" size)" \
 	"$PCDUINO3B_NAND_SPL_REGION_BYTES" 'primary SPL partition size'
@@ -151,9 +246,11 @@ expect_value "$(sysfs_value "$SPL_BACKUP_DEV" size)" \
 	"$PCDUINO3B_NAND_SPL_REGION_BYTES" 'backup SPL partition size'
 expect_value "$(sysfs_value "$UBOOT_DEV" size)" \
 	"$PCDUINO3B_NAND_UBOOT_REGION_BYTES" 'U-Boot partition size'
-expect_value "$(sysfs_value "$UBI_DEV" size)" \
-	"$PCDUINO3B_NAND_UBI_BYTES" 'UBI partition size'
-for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" "$UBI_DEV"; do
+expect_value "$(sysfs_value "$BOOTFIT_DEV" size)" \
+	"$PCDUINO3B_NAND_BOOTFIT_REGION_BYTES" 'boot FIT partition size'
+expect_value "$(sysfs_value "$ROOTFS_DEV" size)" \
+	"$PCDUINO3B_NAND_ROOTFS_LOGICAL_BYTES" 'SLC rootfs partition size'
+for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" "$BOOTFIT_DEV"; do
 	expect_value "$(sysfs_value "$device" erasesize)" \
 		"$PCDUINO3B_NAND_ERASE_BYTES" "$device erase size"
 	expect_value "$(sysfs_value "$device" writesize)" \
@@ -161,21 +258,61 @@ for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" "$UBI_DEV"; do
 	expect_value "$(sysfs_value "$device" oobsize)" \
 		"$PCDUINO3B_NAND_OOB_BYTES" "$device OOB size"
 done
+expect_value "$(sysfs_value "$ROOTFS_DEV" erasesize)" \
+	"$PCDUINO3B_NAND_ROOTFS_PEB_BYTES" "$ROOTFS_DEV SLC erase size"
+expect_value "$(sysfs_value "$ROOTFS_DEV" writesize)" \
+	"$PCDUINO3B_NAND_PAGE_BYTES" "$ROOTFS_DEV page size"
+expect_value "$(sysfs_value "$ROOTFS_DEV" oobsize)" \
+	"$PCDUINO3B_NAND_OOB_BYTES" "$ROOTFS_DEV OOB size"
+for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" \
+	"$BOOTFIT_DEV" "$ROOTFS_DEV"; do
+	expect_value "$(sysfs_value "$device" ecc_strength)" \
+		"$PCDUINO3B_NAND_ECC_STRENGTH" "$device ECC strength"
+	expect_value "$(sysfs_value "$device" ecc_step_size)" \
+		"$PCDUINO3B_NAND_ECC_STEP_BYTES" "$device ECC step size"
+done
 for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV"; do
-	expect_value "$(sysfs_value "$device" bad_blocks)" 0 \
+	expect_value "$(bad_block_count "$device")" 0 \
 		"$device boot-region bad-block count"
 done
+BOOTFIT_BAD_BLOCKS="$(bad_block_count "$BOOTFIT_DEV")"
+ROOTFS_BAD_BLOCKS="$(bad_block_count "$ROOTFS_DEV")"
 
 [[ -d "$PAYLOAD_DIR" ]] || die "payload directory is missing: $PAYLOAD_DIR"
 SPL_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-spl-with-ecc.bin"
 UBOOT_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-u-boot.bin"
+BOOTFIT_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-boot.itb"
 ROOTFS_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-rootfs.ubi"
-for file in "$SPL_IMAGE" "$UBOOT_IMAGE" "$ROOTFS_IMAGE" \
-	"$PAYLOAD_DIR/SHA256SUMS" "$PAYLOAD_DIR/pcduino3b-nand-layout.env"; do
+PAYLOAD_LAYOUT="$PAYLOAD_DIR/pcduino3b-nand-layout.env"
+PAYLOAD_DTBO="$PAYLOAD_DIR/pcduino3b-nand-layout.dtbo"
+PAYLOAD_INSTALLER="$PAYLOAD_DIR/pcduino3b-nand-install"
+PAYLOAD_MANIFEST="$PAYLOAD_DIR/pcduino3b-nand-manifest.txt"
+for file in "$SPL_IMAGE" "$UBOOT_IMAGE" "$BOOTFIT_IMAGE" "$ROOTFS_IMAGE" \
+	"$PAYLOAD_LAYOUT" "$PAYLOAD_DTBO" "$PAYLOAD_INSTALLER" \
+	"$PAYLOAD_MANIFEST" "$PAYLOAD_DIR/SHA256SUMS"; do
 	[[ -s "$file" ]] || die "payload file is missing or empty: $file"
 done
-cmp -s "$LAYOUT_FILE" "$PAYLOAD_DIR/pcduino3b-nand-layout.env" || \
+cmp -s "$LAYOUT_FILE" "$PAYLOAD_LAYOUT" || \
 	die 'payload layout does not match the running installer'
+RUNNING_INSTALLER="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+[[ -n "$RUNNING_INSTALLER" && -f "$RUNNING_INSTALLER" ]] || \
+	die 'cannot resolve the running NAND installer'
+cmp -s "$RUNNING_INSTALLER" "$PAYLOAD_INSTALLER" || \
+	die 'payload installer does not match the running NAND installer'
+for required_name in \
+	pcduino3b-nand-rootfs.ubi \
+	pcduino3b-nand-boot.itb \
+	pcduino3b-nand-spl-with-ecc.bin \
+	pcduino3b-nand-u-boot.bin \
+	pcduino3b-nand-layout.env \
+	pcduino3b-nand-layout.dtbo \
+	pcduino3b-nand-install \
+	pcduino3b-nand-manifest.txt; do
+	entry_count="$(checksum_entry_count \
+		"$PAYLOAD_DIR/SHA256SUMS" "$required_name")"
+	[[ "$entry_count" == 1 ]] || \
+		die "required SHA256SUMS entry count for $required_name is $entry_count, expected 1"
+done
 (
 	cd "$PAYLOAD_DIR"
 	sha256sum -c SHA256SUMS
@@ -183,13 +320,21 @@ cmp -s "$LAYOUT_FILE" "$PAYLOAD_DIR/pcduino3b-nand-layout.env" || \
 
 SPL_BYTES="$(stat -c %s "$SPL_IMAGE")"
 UBOOT_BYTES="$(stat -c %s "$UBOOT_IMAGE")"
+BOOTFIT_BYTES="$(stat -c %s "$BOOTFIT_IMAGE")"
 ROOTFS_BYTES="$(stat -c %s "$ROOTFS_IMAGE")"
 PHYSICAL_PAGE_BYTES=$((PCDUINO3B_NAND_PAGE_BYTES + PCDUINO3B_NAND_OOB_BYTES))
 ((SPL_BYTES > 0 && SPL_BYTES % PHYSICAL_PAGE_BYTES == 0)) || \
 	die "SPL raw image size is not a whole data+OOB page: $SPL_BYTES"
 ((UBOOT_BYTES > 0 && UBOOT_BYTES <= PCDUINO3B_NAND_UBOOT_MAX_BYTES)) || \
 	die "U-Boot image is outside the accepted size range: $UBOOT_BYTES"
-((ROOTFS_BYTES > 0 && ROOTFS_BYTES % PCDUINO3B_NAND_ERASE_BYTES == 0)) || \
+((BOOTFIT_BYTES > 0 && BOOTFIT_BYTES <= PCDUINO3B_NAND_BOOTFIT_MAX_BYTES)) || \
+	die "boot FIT image is outside the accepted size range: $BOOTFIT_BYTES"
+dumpimage -l "$BOOTFIT_IMAGE" >/dev/null || die 'boot FIT image is invalid'
+BOOTFIT_USABLE_BYTES=$((PCDUINO3B_NAND_BOOTFIT_REGION_BYTES - \
+	BOOTFIT_BAD_BLOCKS * PCDUINO3B_NAND_ERASE_BYTES))
+((BOOTFIT_USABLE_BYTES >= PCDUINO3B_NAND_BOOTFIT_READ_BYTES)) || \
+	die "boot FIT partition lacks the required good-block reserve: $BOOTFIT_USABLE_BYTES"
+((ROOTFS_BYTES > 0 && ROOTFS_BYTES % PCDUINO3B_NAND_ROOTFS_PEB_BYTES == 0)) || \
 	die "UBI image is not PEB-aligned: $ROOTFS_BYTES"
 SPL_PAGES=$((SPL_BYTES / PHYSICAL_PAGE_BYTES))
 SPL_DATA_BYTES=$((SPL_PAGES * PCDUINO3B_NAND_PAGE_BYTES))
@@ -201,11 +346,14 @@ pcDuino3B NAND installation plan
   primary SPL:       $SPL_PRIMARY_DEV (offset 0x00000000)
   backup SPL:        $SPL_BACKUP_DEV (offset 0x00400000)
   U-Boot:            $UBOOT_DEV (offset 0x00800000)
-  UBI rootfs:        $UBI_DEV (offset 0x02000000)
+  boot FIT:          $BOOTFIT_DEV (offset 0x02000000)
+  SLC UBI rootfs:    $ROOTFS_DEV (physical offset 0x08000000)
   SPL physical pages:$SPL_PAGES
   U-Boot bytes:      $UBOOT_BYTES
+  boot FIT bytes:    $BOOTFIT_BYTES
+  boot FIT bad blocks:$BOOTFIT_BAD_BLOCKS
   UBI image bytes:   $ROOTFS_BYTES
-  UBI bad blocks:    $(sysfs_value "$UBI_DEV" bad_blocks)
+  rootfs bad blocks: $ROOTFS_BAD_BLOCKS
 PLAN
 
 if [[ "$MODE" == plan ]]; then
@@ -222,8 +370,11 @@ expect_value "$BACKUP_SHA256" "$PCDUINO3B_NAND_BASELINE_BACKUP_SHA256" \
 	'host backup SHA-256'
 [[ "$HOST_BACKUP_CONFIRMED" == yes ]] || \
 	die '--host-backup-confirmed is required'
-[[ ! -e /sys/class/ubi/ubi0 ]] || \
-	die 'a UBI device is already attached; detach it before installation'
+for ubi_path in /sys/class/ubi/ubi[0-9]*; do
+	[[ -e "$ubi_path" ]] || continue
+	[[ "${ubi_path##*/}" =~ ^ubi[0-9]+$ ]] || continue
+	die "a UBI device is already attached (${ubi_path##*/}); detach it before installation"
+done
 
 LOG_FILE="/var/log/pcduino3b-nand-install-$(date -u +%Y%m%dT%H%M%SZ).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -232,11 +383,13 @@ echo 'HOST_BACKUP_CONFIRMED=yes'
 echo "PAYLOAD_SHA256=$(sha256sum "$PAYLOAD_DIR/SHA256SUMS" | awk '{print $1}')"
 
 MOUNT_DIR="$(mktemp -d /run/pcduino3b-nand-rootfs.XXXXXX)"
-trap cleanup EXIT INT TERM
+trap exit_with_cleanup EXIT
+trap 'abort_on_signal SIGINT 130' INT
+trap 'abort_on_signal SIGTERM 143' TERM
 
 echo 'PHASE=write-ubi-rootfs'
-ubiformat "$UBI_DEV" --yes --flash-image "$ROOTFS_IMAGE"
-UBI_MTD_NUM="${UBI_DEV#/dev/mtd}"
+ubiformat "$ROOTFS_DEV" --yes --flash-image "$ROOTFS_IMAGE"
+UBI_MTD_NUM="${ROOTFS_DEV#/dev/mtd}"
 ubiattach /dev/ubi_ctrl -m "$UBI_MTD_NUM"
 ATTACHED_MTD="$UBI_MTD_NUM"
 for _ in {1..30}; do
@@ -251,7 +404,7 @@ grep -qx 'ARMBIAN_BOARD=pcduino3b' "$MOUNT_DIR/etc/pcduino3b-build-info"
 grep -qx 'IMAGE_PROFILE=nand-rootfs' "$MOUNT_DIR/etc/pcduino3b-build-info"
 grep -qx 'rootdev=ubi0:rootfs' "$MOUNT_DIR/boot/armbianEnv.txt"
 grep -qx 'rootfstype=ubifs' "$MOUNT_DIR/boot/armbianEnv.txt"
-grep -Eq '^extraargs=.*ubi\.mtd=ubi([[:space:]]|$)' \
+grep -Eq '^extraargs=.*ubi\.mtd=rootfs([[:space:]]|$)' \
 	"$MOUNT_DIR/boot/armbianEnv.txt"
 test -s "$MOUNT_DIR/boot/boot.scr"
 test -s "$MOUNT_DIR/boot/zImage"
@@ -260,6 +413,14 @@ test -s "$MOUNT_DIR/boot/overlay-user/pcduino3b-nand-layout.dtbo"
 umount "$MOUNT_DIR"
 ubidetach /dev/ubi_ctrl -m "$UBI_MTD_NUM"
 ATTACHED_MTD=
+
+verify_bootfit() {
+	local readback="$MOUNT_DIR/boot.itb"
+	nanddump --quiet --bb=skipbad --length "$BOOTFIT_BYTES" \
+		--file "$readback" "$BOOTFIT_DEV"
+	cmp "$BOOTFIT_IMAGE" "$readback"
+	dumpimage -l "$readback" >/dev/null
+}
 
 verify_raw_spl() {
 	local device="$1" label="$2" readback="$MOUNT_DIR/${label}.raw"
@@ -274,6 +435,11 @@ verify_uboot() {
 		--file "$readback" "$UBOOT_DEV"
 	cmp "$UBOOT_IMAGE" "$readback"
 }
+
+echo 'PHASE=write-boot-fit'
+flash_erase "$BOOTFIT_DEV" 0 0
+nandwrite --pad "$BOOTFIT_DEV" "$BOOTFIT_IMAGE"
+verify_bootfit
 
 echo 'PHASE=write-backup-spl'
 flash_erase "$SPL_BACKUP_DEV" 0 0

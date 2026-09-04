@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pcDuino3B Armbian CI <noreply@github.com>
 Date: Fri, 4 Sep 2026 18:00:00 +0800
-Subject: [PATCH] mtd: rawnand: add Hynix H27UBG8T2C identification
+Subject: [PATCH] mtd: rawnand: support Hynix H27UBG8T2C SLC emulation
 
 The onboard 4 GiB NAND on pcDuino3B reports the six-byte ID
 ad d7 94 91 60 44 and does not provide a recoverable ONFI parameter
@@ -10,10 +10,107 @@ page and 128-byte OOB geometry.
 
 Add the exact ID with the geometry verified on hardware: 8 KiB pages,
 640-byte OOB, 2 MiB eraseblocks and 40-bit ECC per 1 KiB step.
----
- drivers/mtd/nand/raw/nand_ids.c | 4 ++++
- 1 file changed, 4 insertions(+)
 
+The H27UBG8T2CTR-BC data sheet defines a distance-six paired-page
+layout: pages 0/1 pair with 4/5, pages 2/3 pair with 8/9, and the
+pattern continues in adjacent-page groups.  Add that pairing scheme and
+select it only for this exact model so fixed partitions can safely use
+the kernel's SLC-on-MLC emulation.
+---
+ drivers/mtd/nand/raw/internals.h  |  1 +
+ drivers/mtd/nand/raw/nand_base.c  | 39 ++++++++++++++++++++++++++++++++
+ drivers/mtd/nand/raw/nand_hynix.c | 11 +++++++++
+ drivers/mtd/nand/raw/nand_ids.c   |  4 ++++
+ 4 files changed, 55 insertions(+)
+
+diff --git a/drivers/mtd/nand/raw/internals.h b/drivers/mtd/nand/raw/internals.h
+--- a/drivers/mtd/nand/raw/internals.h
++++ b/drivers/mtd/nand/raw/internals.h
+@@ -78,6 +78,7 @@ extern const struct nand_manufacturer_ops toshiba_nand_manuf_ops;
+ 
+ /* MLC pairing schemes */
+ extern const struct mtd_pairing_scheme dist3_pairing_scheme;
++extern const struct mtd_pairing_scheme dist6_pairing_scheme;
+ 
+ /* Core functions */
+ const struct nand_manufacturer_desc *nand_get_manufacturer_desc(u8 id);
+diff --git a/drivers/mtd/nand/raw/nand_base.c b/drivers/mtd/nand/raw/nand_base.c
+--- a/drivers/mtd/nand/raw/nand_base.c
++++ b/drivers/mtd/nand/raw/nand_base.c
+@@ -96,6 +96,45 @@ const struct mtd_pairing_scheme dist3_pairing_scheme = {
+ 	.get_wunit = nand_pairing_dist3_get_wunit,
+ };
+ 
++/* Pair two adjacent pages with pages six positions ahead after the prologue. */
++static int nand_pairing_dist6_get_info(struct mtd_info *mtd, int page,
++				       struct mtd_pairing_info *info)
++{
++	bool last2pages, lsbit = page & 1;
++
++	page >>= 1;
++	last2pages = ((page + 1) * 2 * mtd->writesize) == mtd->erasesize;
++	page += (page != 0) + last2pages;
++
++	info->group = page & 1;
++	if (page & 1)
++		page -= 3;
++
++	info->pair = page | lsbit;
++
++	return 0;
++}
++
++static int nand_pairing_dist6_get_wunit(struct mtd_info *mtd,
++					const struct mtd_pairing_info *info)
++{
++	int page = (info->pair & ~1) + (3 * info->group);
++	bool last2pages = (page * 2 * mtd->writesize) > mtd->erasesize;
++
++	page -= (page != 0) + last2pages;
++	page = (2 * page) + (info->pair & 1);
++	if (page >= mtd->erasesize / mtd->writesize)
++		return -EINVAL;
++
++	return page;
++}
++
++const struct mtd_pairing_scheme dist6_pairing_scheme = {
++	.ngroups = 2,
++	.get_info = nand_pairing_dist6_get_info,
++	.get_wunit = nand_pairing_dist6_get_wunit,
++};
++
+ static int check_offs_len(struct nand_chip *chip, loff_t ofs, uint64_t len)
+ {
+ 	int ret = 0;
+diff --git a/drivers/mtd/nand/raw/nand_hynix.c b/drivers/mtd/nand/raw/nand_hynix.c
+--- a/drivers/mtd/nand/raw/nand_hynix.c
++++ b/drivers/mtd/nand/raw/nand_hynix.c
+@@ -695,6 +695,13 @@ static int h27ucg8t2etrbc_init(struct nand_chip *chip)
+ 	return 0;
+ }
+ 
++static void h27ubg8t2ctrbc_init(struct nand_chip *chip)
++{
++	struct mtd_info *mtd = nand_to_mtd(chip);
++
++	mtd_set_pairing_scheme(mtd, &dist6_pairing_scheme);
++}
++
+ static int hynix_nand_init(struct nand_chip *chip)
+ {
+ 	struct hynix_nand *hynix;
+@@ -720,6 +727,10 @@ static int hynix_nand_init(struct nand_chip *chip)
+ 		     sizeof("H27UCG8T2ETR-BC") - 1))
+ 		h27ucg8t2etrbc_init(chip);
+ 
++	if (!strncmp("H27UBG8T2CTR-BC", chip->parameters.model,
++		     sizeof("H27UBG8T2CTR-BC") - 1))
++		h27ubg8t2ctrbc_init(chip);
++
+ 	ret = hynix_nand_rr_init(chip);
+ 	if (ret)
+ 		hynix_nand_cleanup(chip);
 diff --git a/drivers/mtd/nand/raw/nand_ids.c b/drivers/mtd/nand/raw/nand_ids.c
 --- a/drivers/mtd/nand/raw/nand_ids.c
 +++ b/drivers/mtd/nand/raw/nand_ids.c

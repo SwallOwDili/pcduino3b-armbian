@@ -6,8 +6,21 @@ Subject: [PATCH] sunxi: pcduino3b: enable onboard H27UBG8T2C NAND
 Add a dedicated pcDuino3B U-Boot control DT instead of changing the
 upstream pcDuino3 DT. Keep the registered pcDuino3 compatible base, but
 expose the correct 3B model, verified RGMII-ID wiring, 3B-prefixed NAND
-nodes and the fixed boot/UBI layout. Enable UBIFS as the fallback after
-microSD and add the exact NAND ID.
+nodes and the fixed boot-FIT/rootfs layout. The board configuration loads
+the self-contained FIT after removable-media targets and this patch adds
+the exact NAND ID.
+
+Fix the SPL ECC-strength probe to compare whole-page ECC and user-data
+usage against the whole OOB area. The v2026.07 per-step/whole-page unit
+mix-up otherwise caps this 8 KiB/640-byte-OOB device at 24-bit ECC, while
+Linux writes U-Boot proper with the required 40-bit/1 KiB configuration.
+---
+ arch/arm/dts/Makefile                        |  1 +
+ arch/arm/dts/sun7i-a20-pcduino3b.dts         | 87 ++++++++++++++++++++
+ drivers/mtd/nand/raw/nand_ids.c              |  4 +
+ drivers/mtd/nand/raw/sunxi_nand_spl.c        |  7 +-
+ 4 files changed, 95 insertions(+), 4 deletions(-)
+ create mode 100644 arch/arm/dts/sun7i-a20-pcduino3b.dts
 
 diff --git a/arch/arm/dts/Makefile b/arch/arm/dts/Makefile
 index 2b65cd9..3758a39 100644
@@ -26,7 +39,7 @@ new file mode 100644
 index 0000000..1e72982
 --- /dev/null
 +++ b/arch/arm/dts/sun7i-a20-pcduino3b.dts
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,87 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 +/*
 + * LinkSprite pcDuino3B U-Boot control device tree.
@@ -84,8 +97,13 @@ index 0000000..1e72982
 +			};
 +
 +			partition@2000000 {
-+				label = "ubi";
-+				reg = <0x02000000 0xfe000000>;
++				label = "bootfit";
++				reg = <0x02000000 0x06000000>;
++			};
++
++			partition@8000000 {
++				label = "rootfs";
++				reg = <0x08000000 0xf8000000>;
 +			};
 +		};
 +	};
@@ -124,31 +142,37 @@ index 4f46378..809ccf7 100644
  	{"H27UCG8T2ATR-BC 64G 3.3V 8-bit",
  		{ .id = {0xad, 0xde, 0x94, 0xda, 0x74, 0xc4} },
  		  SZ_8K, SZ_8K, SZ_2M, NAND_NEED_SCRAMBLING, 6, 640,
-diff --git a/include/configs/sunxi-common.h b/include/configs/sunxi-common.h
-index 49d5617..465c079 100644
---- a/include/configs/sunxi-common.h
-+++ b/include/configs/sunxi-common.h
-@@ -208,6 +208,13 @@
- #define BOOT_TARGET_DEVICES_DHCP(func)
- #endif
+diff --git a/drivers/mtd/nand/raw/sunxi_nand_spl.c b/drivers/mtd/nand/raw/sunxi_nand_spl.c
+index cf351de..06608d8 100644
+--- a/drivers/mtd/nand/raw/sunxi_nand_spl.c
++++ b/drivers/mtd/nand/raw/sunxi_nand_spl.c
+@@ -427,7 +427,7 @@ static int nand_maximize_user_data(struct nfc_config *conf, uint32_t oobsize,
  
-+#ifdef CONFIG_CMD_UBIFS
-+#define BOOT_TARGET_DEVICES_UBIFS(func) \
-+	func(UBIFS, ubifs, 0, ubi, rootfs)
-+#else
-+#define BOOT_TARGET_DEVICES_UBIFS(func)
-+#endif
-+
- /* FEL boot support, auto-execute boot.scr if a script address was provided */
- #define BOOTENV_DEV_FEL(devtypeu, devtypel, instance) \
- 	"bootcmd_fel=" \
-@@ -221,6 +228,7 @@
- #define BOOT_TARGET_DEVICES(func) \
- 	func(FEL, fel, na) \
- 	BOOT_TARGET_DEVICES_MMC(func) \
-+	BOOT_TARGET_DEVICES_UBIFS(func) \
- 	BOOT_TARGET_DEVICES_SCSI(func) \
- 	BOOT_TARGET_DEVICES_USB(func) \
- 	BOOT_TARGET_DEVICES_PXE(func) \
+ static int nand_max_ecc_strength(struct nfc_config *conf)
+ {
+-	int max_oobsize, max_ecc_bytes;
++	int max_oobsize;
+ 	int nsectors = conf->page_size / conf->ecc_size;
+ 	unsigned int total_user_data_sz = 0;
+ 	int ecc_idx, i;
+@@ -453,8 +453,6 @@ static int nand_max_ecc_strength(struct nfc_config *conf)
+ 		return -EINVAL;
+ 	}
+ 
+-	max_ecc_bytes = max_oobsize / nsectors;
+-
+ 	/*
+ 	 * nand_min_user_data_sz() will return the total_user_data_sz in case
+ 	 * of a fixed user data length, or the minimal usable user data size
+@@ -464,7 +462,8 @@ static int nand_max_ecc_strength(struct nfc_config *conf)
+ 	total_user_data_sz = nand_min_user_data_sz(conf, nsectors);
+ 
+ 	for (ecc_idx = 0; ecc_idx < ARRAY_SIZE(ecc_bytes); ecc_idx++) {
+-		if (ecc_bytes[ecc_idx] + total_user_data_sz > max_ecc_bytes)
++		if (ecc_bytes[ecc_idx] * nsectors + total_user_data_sz >
++		    max_oobsize)
+ 			break;
+ 	}
+ 
 -- 
 2.52.0

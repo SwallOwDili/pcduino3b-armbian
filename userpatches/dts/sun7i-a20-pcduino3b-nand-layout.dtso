@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
 /*
  * Writable NAND layout for the pcDuino3B installer and NAND rootfs.
+ * The rootfs partition uses the chip's paired-page-safe SLC emulation.
  * Recovery uses pcduino3b-nand-recovery.dtso instead and exposes no partitions.
  */
 
@@ -68,8 +69,14 @@
 					};
 
 					partition@2000000 {
-						label = "ubi";
-						reg = <0x02000000 0xfe000000>;
+						label = "bootfit";
+						reg = <0x02000000 0x06000000>;
+					};
+
+					partition@8000000 {
+						label = "rootfs";
+						reg = <0x08000000 0xf8000000>;
+						slc-mode;
 					};
 				};
 			};

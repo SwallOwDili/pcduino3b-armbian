@@ -157,10 +157,16 @@ require_match 'nand-ecc-mode = "hw";' "$NAND_OVERLAY" \
 if grep -Eq '^[[:space:]]*(nand-on-flash-bbt|partitions)[[:space:]{;]' "$NAND_OVERLAY"; then
 	fail 'fast repack overlay must not declare persistent BBT or a partition map'
 fi
-for label in spl-primary spl-backup uboot ubi; do
+for label in spl-primary spl-backup uboot bootfit rootfs; do
 	require_match "label = \"$label\";" "$NAND_LAYOUT_OVERLAY" \
 		"installer layout overlay is missing $label"
 done
+require_match 'reg = <0x02000000 0x06000000>;' "$NAND_LAYOUT_OVERLAY" \
+	'installer layout overlay has the wrong raw boot FIT region'
+require_match 'reg = <0x08000000 0xf8000000>;' "$NAND_LAYOUT_OVERLAY" \
+	'installer layout overlay has the wrong SLC rootfs region'
+require_match 'slc-mode;' "$NAND_LAYOUT_OVERLAY" \
+	'installer layout overlay must enable paired-page SLC emulation'
 
 if ((FAILURES > 0)); then
 	printf 'identity lint: %d failure(s)\n' "$FAILURES" >&2

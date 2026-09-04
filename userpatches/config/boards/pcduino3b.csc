@@ -31,9 +31,16 @@ function post_config_uboot_target__extra_configs_for_pcduino3b() {
 			run_host_command_logged scripts/config --enable CONFIG_CMD_NAND
 			run_host_command_logged scripts/config --enable CONFIG_CMD_MTD
 			run_host_command_logged scripts/config --enable CONFIG_CMD_MTDPARTS
-			run_host_command_logged scripts/config --enable CONFIG_MTD_UBI
-			run_host_command_logged scripts/config --enable CONFIG_CMD_UBI
-			run_host_command_logged scripts/config --enable CONFIG_CMD_UBIFS
+			run_host_command_logged scripts/config --disable CONFIG_MTD_UBI
+			run_host_command_logged scripts/config --disable CONFIG_CMD_UBI
+			run_host_command_logged scripts/config --disable CONFIG_CMD_UBIFS
+			run_host_command_logged scripts/config --enable CONFIG_FIT
+			run_host_command_logged scripts/config --enable CONFIG_FIT_FULL_CHECK
+			run_host_command_logged scripts/config --enable CONFIG_SHA256
+			run_host_command_logged scripts/config --enable CONFIG_CMD_BOOTM
+			run_host_command_logged scripts/config --set-val CONFIG_SYS_BOOTM_LEN "0x04000000"
+			run_host_command_logged scripts/config --set-str CONFIG_BOOTCOMMAND \
+				"run distro_bootcmd; setenv bootargs root=ubi0:rootfs rootwait rootfstype=ubifs rw console=ttyS0,115200 console=tty1 splash=verbose hdmi.audio=EDID:0 disp.screen0_output_mode=1920x1080p60 consoleblank=0 loglevel=1 ubi.mtd=rootfs sunxi_ve_mem_reserve=0 sunxi_g2d_mem_reserve=0 sunxi_fb_mem_reserve=16 cgroup_enable=memory; nand read 0x50000000 0x02000000 0x04000000 && bootm 0x50000000"
 			run_host_command_logged scripts/config --set-val CONFIG_NAND_SUNXI_SPL_ECC_STRENGTH "64"
 			run_host_command_logged scripts/config --set-val CONFIG_NAND_SUNXI_SPL_ECC_SIZE "1024"
 			run_host_command_logged scripts/config --set-val CONFIG_NAND_SUNXI_SPL_USABLE_PAGE_SIZE "1024"

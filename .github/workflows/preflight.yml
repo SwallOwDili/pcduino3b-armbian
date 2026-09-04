@@ -19,6 +19,7 @@ env:
   # action.yml unconditionally publishes a GitHub Release after compilation.
   ARMBIAN_BUILD_REF: 34e66c37211c70ef5cfad9c80dd76389720e19b7
   LINUX_DTS_REF: v6.18.49
+  KERNEL_GIT_REF: tag:v6.18.49
 
 jobs:
   preflight:
@@ -38,7 +39,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends device-tree-compiler shellcheck
+          sudo apt-get install -y --no-install-recommends \
+            device-tree-compiler shellcheck u-boot-tools
 
       - name: Validate workflows and shell
         shell: bash
@@ -154,6 +156,21 @@ jobs:
             test -s "userpatches/kernel/archive/sunxi-${series}/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
           done
 
+          pinned_config_json="$RUNNER_TEMP/pcduino3b-board-current-pinned.json"
+          CI=false ANSI_COLOR=none WRITE_EXTENSIONS_METADATA=no \
+            CONFIG_DEFS_ONLY=yes armbian-framework/compile.sh config-dump-json \
+            BOARD=pcduino3b \
+            BRANCH=current \
+            KERNELBRANCH="$KERNEL_GIT_REF" \
+            RELEASE=noble \
+            BUILD_DESKTOP=no \
+            BUILD_MINIMAL=yes \
+            ENABLE_EXTENSIONS=pcduino3b-gigabit \
+            > "$pinned_config_json"
+          jq -e --arg ref "$KERNEL_GIT_REF" \
+            '.KERNEL_MAJOR_MINOR == "6.18" and .KERNELBRANCH == $ref' \
+            "$pinned_config_json"
+
       - name: Checkout Linux DTS baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -197,13 +214,18 @@ jobs:
           git -C linux-dts add arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
           git -C linux-dts apply --check "$dts_patch"
           git -C linux-dts apply "$dts_patch"
-          git -C linux-dts apply --check "$nand_id_patch"
+          git -C linux-dts apply --whitespace=error-all --check "$nand_id_patch"
           git -C linux-dts apply "$nand_id_patch"
+          git -C linux-dts diff --check
           git -C linux-dts diff --exit-code -- arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
           grep -Fq '0xad, 0xd7, 0x94, 0x91, 0x60, 0x44' \
             linux-dts/drivers/mtd/nand/raw/nand_ids.c
           grep -Fq 'NAND_ECC_INFO(40, SZ_1K)' \
             linux-dts/drivers/mtd/nand/raw/nand_ids.c
+          grep -Fq 'const struct mtd_pairing_scheme dist6_pairing_scheme' \
+            linux-dts/drivers/mtd/nand/raw/nand_base.c
+          grep -Fq 'mtd_set_pairing_scheme(mtd, &dist6_pairing_scheme);' \
+            linux-dts/drivers/mtd/nand/raw/nand_hynix.c
 
           compile_dtb() {
             local source="$1"
@@ -274,7 +296,38 @@ jobs:
           [[ "$(fdtget -t x "$layout_dtb" "$layout_partitions/partition@0" reg)" == '0 400000' ]]
           [[ "$(fdtget -t x "$layout_dtb" "$layout_partitions/partition@400000" reg)" == '400000 400000' ]]
           [[ "$(fdtget -t x "$layout_dtb" "$layout_partitions/partition@800000" reg)" == '800000 1800000' ]]
-          [[ "$(fdtget -t x "$layout_dtb" "$layout_partitions/partition@2000000" reg)" == '2000000 fe000000' ]]
+          [[ "$(fdtget -t s "$layout_dtb" "$layout_partitions/partition@2000000" label)" == bootfit ]]
+          [[ "$(fdtget -t x "$layout_dtb" "$layout_partitions/partition@2000000" reg)" == '2000000 6000000' ]]
+          [[ "$(fdtget -t s "$layout_dtb" "$layout_partitions/partition@8000000" label)" == rootfs ]]
+          [[ "$(fdtget -t x "$layout_dtb" "$layout_partitions/partition@8000000" reg)" == '8000000 f8000000' ]]
+          fdtget -p "$layout_dtb" "$layout_partitions/partition@8000000" \
+            | grep -qx slc-mode
+
+          # Exercise the exact ITS and the notifier-only runtime DT mutation.
+          # The checked-in SD installer overlay must remain free of linux,ubi.
+          runtime_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-runtime.dtb"
+          cp "$layout_dtb" "$runtime_dtb"
+          rootfs_partition="$layout_partitions/partition@8000000"
+          fdtput -t s "$runtime_dtb" "$rootfs_partition" compatible linux,ubi
+          [[ "$(fdtget -t s "$runtime_dtb" "$rootfs_partition" compatible)" == linux,ubi ]]
+          fdtget -p "$runtime_dtb" "$rootfs_partition" | grep -qx slc-mode
+          ! grep -Fq 'linux,ubi' "$layout_overlay"
+
+          fit_dir="$RUNNER_TEMP/pcduino3b-nand-fit-fixture"
+          mkdir -p "$fit_dir"
+          printf 'kernel-fixture' > "$fit_dir/zImage"
+          printf 'initramfs-fixture' > "$fit_dir/initrd.img"
+          cp "$runtime_dtb" "$fit_dir/pcduino3b-nand-runtime.dtb"
+          cp "$GITHUB_WORKSPACE/userpatches/pcduino3b-nand-boot.its" \
+            "$fit_dir/pcduino3b-nand-boot.its"
+          (
+            cd "$fit_dir"
+            SOURCE_DATE_EPOCH=0 mkimage -f pcduino3b-nand-boot.its \
+              pcduino3b-nand-boot.itb >/dev/null
+            dumpimage -l pcduino3b-nand-boot.itb > fit-list.txt
+          )
+          grep -Fq 'pcDuino3B NAND boot FIT' "$fit_dir/fit-list.txt"
+          [[ "$(grep -Fc 'Hash algo:    sha256' "$fit_dir/fit-list.txt")" -eq 3 ]]
 
           compile_dtb \
             linux-dts/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b-nand-recovery.dts \
@@ -315,18 +368,23 @@ jobs:
           patch="$GITHUB_WORKSPACE/userpatches/u-boot/v2026.07-sunxi/board_pcduino3b/0001-pcduino3b-enable-onboard-nand.patch"
           git -C u-boot apply --check "$patch"
           git -C u-boot apply "$patch"
+          git -C u-boot diff --check
 
           grep -Fq '0xad, 0xd7, 0x94, 0x91, 0x60, 0x44' \
             u-boot/drivers/mtd/nand/raw/nand_ids.c
           grep -Fq 'NAND_ECC_INFO(40, SZ_1K), 0' \
             u-boot/drivers/mtd/nand/raw/nand_ids.c
+          grep -Fq 'ecc_bytes[ecc_idx] * nsectors + total_user_data_sz >' \
+            u-boot/drivers/mtd/nand/raw/sunxi_nand_spl.c
+          ! grep -Fq 'ecc_bytes[ecc_idx] + total_user_data_sz > max_ecc_bytes' \
+            u-boot/drivers/mtd/nand/raw/sunxi_nand_spl.c
           git -C u-boot diff --exit-code -- arch/arm/dts/sun7i-a20-pcduino3.dts
           uboot_dts=u-boot/arch/arm/dts/sun7i-a20-pcduino3b.dts
           grep -Fq 'model = "LinkSprite pcDuino3B";' "$uboot_dts"
           grep -Fq 'phy-mode = "rgmii-id";' "$uboot_dts"
           grep -Fq 'pcduino3b_nand_pins: nand-pins' "$uboot_dts"
           grep -Fq '&nfc {' "$uboot_dts"
-          for label in spl-primary spl-backup uboot ubi; do
+          for label in spl-primary spl-backup uboot bootfit rootfs; do
             grep -Fq "label = \"$label\";" "$uboot_dts"
           done
 
@@ -340,13 +398,8 @@ jobs:
           [[ "$(fdtget -t s "$RUNNER_TEMP/sun7i-a20-pcduino3b-u-boot.dtb" / model)" == 'LinkSprite pcDuino3B' ]]
           [[ "$(fdtget -t s "$RUNNER_TEMP/sun7i-a20-pcduino3b-u-boot.dtb" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
           [[ "$(fdtget -t s "$RUNNER_TEMP/sun7i-a20-pcduino3b-u-boot.dtb" /soc/nand-controller@1c03000 status)" == okay ]]
-          grep -Fq 'func(UBIFS, ubifs, 0, ubi, rootfs)' \
+          ! grep -Fq 'BOOT_TARGET_DEVICES_UBIFS' \
             u-boot/include/configs/sunxi-common.h
-          awk '
-            /BOOT_TARGET_DEVICES_MMC\(func\)/ { mmc = NR }
-            /BOOT_TARGET_DEVICES_UBIFS\(func\)/ { ubifs = NR }
-            END { exit !(mmc > 0 && ubifs > mmc) }
-          ' u-boot/include/configs/sunxi-common.h
 
       - name: Preflight summary
         if: always()

@@ -45,6 +45,7 @@ section "MTD geometry exposed by sysfs"
 MTD_COUNT=0
 for mtd_path in "$SYS_ROOT"/class/mtd/mtd[0-9]*; do
 	[[ -d "$mtd_path" ]] || continue
+	[[ "${mtd_path##*/}" =~ ^mtd[0-9]+$ ]] || continue
 	MTD_COUNT=$((MTD_COUNT + 1))
 	printf '[%s]\n' "$(basename "$mtd_path")"
 	for field in name type size erasesize writesize subpagesize oobsize \

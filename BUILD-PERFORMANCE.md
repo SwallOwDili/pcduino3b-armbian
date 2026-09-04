@@ -45,7 +45,7 @@
 - Fast preflight 不创建 rootfs、镜像或压缩包，目标 2～5 分钟。
 - `dev` 使用 Minimal rootfs 和快速压缩/短期 artifact，不创建正式 Release。
 - `sd-release` 使用 xz、SHA-256 和完整镜像验收。
-- `nand-installer`、`nand-recovery` 使用 Minimal rootfs；recovery 保持只读探测，installer 另带显式安全门，并由 CI 从同一已验收 rootfs 生成 UBI 安装 bundle。
+- `nand-installer`、`nand-recovery` 使用 Minimal rootfs；recovery 保持只读探测，installer 另带显式安全门，并由 CI 从同一已验收 rootfs 生成 raw boot FIT 与 SLC-emulated UBI 安装 bundle。
 - Release promotion 复用已验收候选文件，不重新编译、组装或压缩。
 - 包清单由 `packages/common.txt` 与 `packages/<profile>.txt` 聚合，再由 extension 的 `add_packages_to_image` 正式接口加入镜像；定制脚本仍执行一次必须成功的 `apt-get update`、DNS 和 Noble InRelease HTTPS 检查，但不再维护第二份安装列表。
 

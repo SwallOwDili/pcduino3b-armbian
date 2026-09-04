@@ -58,6 +58,7 @@ env:
   LINUXFAMILY: sunxi
   KERNEL_BRANCH: current
   KERNEL_SERIES: '6.18'
+  KERNEL_GIT_REF: tag:v6.18.49
   RELEASE: noble
 
 jobs:
@@ -189,7 +190,7 @@ jobs:
           dts_hash=$(hash_paths userpatches/kernel)
           uboot_hash=$(hash_paths userpatches/config/boards/pcduino3b.csc userpatches/u-boot)
           packages_hash=$(hash_paths packages/common.txt "packages/${profile}.txt")
-          cache_base="armbian-${RUNNER_OS}-arm-${ARMBIAN_BUILD_REF}-${ARMBIAN_OS_REF}-${BOARDFAMILY}-${BOARD}-${KERNEL_BRANCH}-${KERNEL_SERIES}-${RELEASE}"
+          cache_base="armbian-${RUNNER_OS}-arm-${ARMBIAN_BUILD_REF}-${ARMBIAN_OS_REF}-${BOARDFAMILY}-${BOARD}-${KERNEL_BRANCH}-${KERNEL_SERIES}-${KERNEL_GIT_REF}-${RELEASE}"
 
           mkdir -p userpatches/overlay/etc
           printf '%s\n' "$profile" > userpatches/overlay/etc/pcduino3b-image-profile
@@ -213,7 +214,7 @@ jobs:
             echo "cache_base=$cache_base"
             echo "artifact_cache_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
             # Compiled packages are profile-sensitive: only NAND profiles enable
-            # the NAND/UBI U-Boot feature set.  A broad fallback could silently
+            # the raw-NAND/FIT U-Boot feature set.  A broad fallback could silently
             # restore an SD-only U-Boot package into a NAND image.
             echo "artifact_restore_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
             echo "ccache_key=${cache_base}-ccache-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
@@ -406,6 +407,7 @@ jobs:
             REVISION="$ARMBIAN_VERSION"
             BOARD="$BOARD"
             BRANCH="$KERNEL_BRANCH"
+            KERNELBRANCH="$KERNEL_GIT_REF"
             RELEASE="$RELEASE"
             KERNEL_CONFIGURE=no
             BUILD_DESKTOP=no
@@ -542,7 +544,8 @@ jobs:
               partition@0 \
               partition@400000 \
               partition@800000 \
-              partition@2000000; do
+              partition@2000000 \
+              partition@8000000; do
               echo "NAND_OVERLAY_PARTITION=$partition label=$(fdtget -t s "$composed" "$partitions/$partition" label) reg=$(fdtget -t x "$composed" "$partitions/$partition" reg)"
             done
             [[ "$(fdtget -t s "$composed" "$partitions" compatible)" == fixed-partitions ]]
@@ -552,8 +555,11 @@ jobs:
             [[ "$(fdtget -t x "$composed" "$partitions/partition@400000" reg)" == '400000 400000' ]]
             [[ "$(fdtget -t s "$composed" "$partitions/partition@800000" label)" == uboot ]]
             [[ "$(fdtget -t x "$composed" "$partitions/partition@800000" reg)" == '800000 1800000' ]]
-            [[ "$(fdtget -t s "$composed" "$partitions/partition@2000000" label)" == ubi ]]
-            [[ "$(fdtget -t x "$composed" "$partitions/partition@2000000" reg)" == '2000000 fe000000' ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@2000000" label)" == bootfit ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@2000000" reg)" == '2000000 6000000' ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@8000000" label)" == rootfs ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@8000000" reg)" == '8000000 f8000000' ]]
+            fdtget -p "$composed" "$partitions/partition@8000000" | grep -qx slc-mode
           elif fdtget -l "$composed" "$nand" | grep -qx partitions; then
             echo 'Recovery overlay must not declare NAND partitions' >&2
             exit 1
@@ -702,9 +708,13 @@ jobs:
               nand_uboot_bytes=$(sudo stat -c %s "${nand_uboot_files[0]}")
               ((nand_uboot_bytes > 0 && nand_uboot_bytes <= 0xc0000))
               sudo grep -aFq 'H27UBG8T2CTR-BC' "${nand_uboot_files[0]}"
-              sudo grep -aFq 'bootcmd_ubifs0=' "${nand_uboot_files[0]}"
-              sudo grep -aFq 'bootubipart=ubi' "${nand_uboot_files[0]}"
-              sudo grep -aFq 'bootubivol=rootfs' "${nand_uboot_files[0]}"
+              sudo grep -aFq 'nand read 0x50000000 0x02000000 0x04000000' \
+                "${nand_uboot_files[0]}"
+              sudo grep -aFq 'bootm 0x50000000' "${nand_uboot_files[0]}"
+              if sudo grep -aFq 'bootcmd_ubifs0=' "${nand_uboot_files[0]}"; then
+                echo 'U-Boot must not read the SLC-emulated rootfs UBI' >&2
+                exit 1
+              fi
               ;;
             dev|sd-release)
               sudo test ! -e "$nand_probe"
@@ -734,8 +744,17 @@ jobs:
               ;;
           esac
 
-          kernel_config=$(find "$mount_dir/boot" -maxdepth 1 -type f -name 'config-*' | sort | tail -n1)
-          [[ -n "$kernel_config" ]] || { echo 'Kernel config not found' >&2; exit 1; }
+          mapfile -t kernel_configs < <(
+            find "$mount_dir/boot" -maxdepth 1 -type f -name 'config-*' | sort
+          )
+          ((${#kernel_configs[@]} == 1)) || {
+            echo "Expected exactly one kernel config, found ${#kernel_configs[@]}" >&2
+            exit 1
+          }
+          kernel_config=${kernel_configs[0]}
+          [[ "$(basename "$kernel_config")" == config-6.18.49-current-sunxi ]]
+          kernel_image=$(readlink -f "$mount_dir/boot/zImage")
+          [[ "$(basename "$kernel_image")" == vmlinuz-6.18.49-current-sunxi ]]
           for option in \
             CONFIG_STMMAC_ETH=y \
             CONFIG_STMMAC_PLATFORM=y \
@@ -756,6 +775,16 @@ jobs:
             sudo find "$mount_dir/usr/lib/modules" -type f \
               -name "${module}.ko*" -print -quit | grep -q .
           done
+          if [[ '${{ steps.config.outputs.profile }}' == nand-installer ]]; then
+            for option in \
+              CONFIG_MTD=y \
+              CONFIG_MTD_RAW_NAND=m \
+              CONFIG_MTD_NAND_SUNXI=m \
+              CONFIG_MTD_UBI=y \
+              CONFIG_UBIFS_FS=y; do
+              sudo grep -qx "$option" "$kernel_config"
+            done
+          fi
 
           base_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb | head -n1)
           recovery_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b-nand-recovery.dtb | head -n1)
@@ -819,7 +848,10 @@ jobs:
                 [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@0" label)" == spl-primary ]]
                 [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@400000" label)" == spl-backup ]]
                 [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@800000" label)" == uboot ]]
-                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@2000000" label)" == ubi ]]
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@2000000" label)" == bootfit ]]
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@8000000" label)" == rootfs ]]
+                sudo fdtget -p "$composed" "$partitions/partition@8000000" \
+                  | grep -qx slc-mode
               elif sudo fdtget -l "$composed" "$recovery_nand" | grep -qx partitions; then
                 echo 'Recovery overlay unexpectedly contains partitions' >&2
                 exit 1
@@ -850,7 +882,7 @@ jobs:
         run: |
           set -euo pipefail
           started=$(date +%s)
-          sudo apt-get install -y --no-install-recommends mtd-utils zstd
+          sudo apt-get install -y --no-install-recommends mtd-utils u-boot-tools zstd
 
           mount_dir=$(mktemp -d)
           rootfs_dir=$(mktemp -d)
@@ -893,6 +925,61 @@ jobs:
             "$mount_dir/boot/overlay-user/pcduino3b-nand-layout.dtbo" \
             "$payload_dir/pcduino3b-nand-layout.dtbo"
 
+          kernel=$(readlink -f "$mount_dir/boot/zImage")
+          kernel_release=${kernel##*/vmlinuz-}
+          initrd="$mount_dir/boot/initrd.img-$kernel_release"
+          [[ -s "$kernel" && -s "$initrd" ]]
+          gzip -t "$initrd"
+          mapfile -t base_dtbs < <(
+            sudo find "$mount_dir/boot" -type f \
+              -name sun7i-a20-pcduino3b.dtb -print
+          )
+          [[ ${#base_dtbs[@]} -eq 1 ]]
+          runtime_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-runtime.dtb"
+          sudo fdtoverlay -i "${base_dtbs[0]}" -o "$runtime_dtb" \
+            "$payload_dir/pcduino3b-nand-layout.dtbo"
+          rootfs_partition=/soc/nand-controller@1c03000/nand@0/partitions/partition@8000000
+          sudo fdtget -p "$runtime_dtb" "$rootfs_partition" | grep -qx slc-mode
+          # UBI is built in while sunxi_nand is loaded by the initramfs.  Mark
+          # only the FIT's runtime partition for the MTD notifier to attach as
+          # soon as the module registers it.  The SD installer overlay remains
+          # unmarked so its pre-write guard always starts with UBI detached.
+          sudo fdtput -t s "$runtime_dtb" "$rootfs_partition" \
+            compatible linux,ubi
+          [[ "$(sudo fdtget -t s "$runtime_dtb" "$rootfs_partition" compatible)" == linux,ubi ]]
+
+          fit_dir="$RUNNER_TEMP/pcduino3b-nand-fit"
+          mkdir -p "$fit_dir"
+          ln -s "$kernel" "$fit_dir/zImage"
+          ln -s "$initrd" "$fit_dir/initrd.img"
+          ln -s "$runtime_dtb" "$fit_dir/pcduino3b-nand-runtime.dtb"
+          kernel_bytes=$(stat -c %s "$kernel")
+          initrd_bytes=$(stat -c %s "$initrd")
+          runtime_dtb_bytes=$(stat -c %s "$runtime_dtb")
+          ((0x42000000 + kernel_bytes <= 0x43000000)) || {
+            echo "Kernel overlaps the FIT FDT load address: $kernel_bytes bytes" >&2
+            exit 1
+          }
+          ((0x43000000 + runtime_dtb_bytes <= 0x43400000)) || {
+            echo "Runtime DTB overlaps the FIT initramfs load address: $runtime_dtb_bytes bytes" >&2
+            exit 1
+          }
+          ((0x43400000 + initrd_bytes <= 0x50000000)) || {
+            echo "Initramfs overlaps the raw FIT read buffer: $initrd_bytes bytes" >&2
+            exit 1
+          }
+          install -m 0644 userpatches/pcduino3b-nand-boot.its \
+            "$fit_dir/pcduino3b-nand-boot.its"
+          boot_fit="$payload_dir/pcduino3b-nand-boot.itb"
+          (
+            cd "$fit_dir"
+            SOURCE_DATE_EPOCH=$(git -C "$GITHUB_WORKSPACE" show -s --format=%ct "$GITHUB_SHA") \
+              mkimage -f pcduino3b-nand-boot.its "$boot_fit"
+          )
+          dumpimage -l "$boot_fit" | tee "$RUNNER_TEMP/pcduino3b-nand-boot-fit.txt"
+          grep -Fq 'pcDuino3B NAND boot FIT' "$RUNNER_TEMP/pcduino3b-nand-boot-fit.txt"
+          grep -Fq 'Hash algo:    sha256' "$RUNNER_TEMP/pcduino3b-nand-boot-fit.txt"
+
           # Build the NAND filesystem from an immutable copy of the accepted
           # SD candidate.  The running installer itself is not copied into the
           # NAND system, and all boot-critical root settings are rewritten.
@@ -919,7 +1006,7 @@ jobs:
             'user_overlays=pcduino3b-nand-layout' \
             'rootdev=ubi0:rootfs' \
             'rootfstype=ubifs' \
-            'extraargs=ubi.mtd=ubi' \
+            'extraargs=ubi.mtd=rootfs' \
             | sudo tee -a "$boot_env" >/dev/null
           sudo sed -i -E \
             '\|^[^#]+[[:space:]]+/[[:space:]]+|c\ubi0:rootfs / ubifs defaults,noatime 0 0' \
@@ -928,7 +1015,7 @@ jobs:
           sudo grep -Fxq sunxi_nand "$rootfs_dir/etc/initramfs-tools/modules"
           sudo grep -Fxq 'rootdev=ubi0:rootfs' "$boot_env"
           sudo grep -Fxq 'rootfstype=ubifs' "$boot_env"
-          sudo grep -Fxq 'extraargs=ubi.mtd=ubi' "$boot_env"
+          sudo grep -Fxq 'extraargs=ubi.mtd=rootfs' "$boot_env"
           sudo grep -Fxq 'ubi0:rootfs / ubifs defaults,noatime 0 0' \
             "$rootfs_dir/etc/fstab"
           sudo test -s "$rootfs_dir/boot/boot.scr"
@@ -939,8 +1026,8 @@ jobs:
           ubi="$payload_dir/pcduino3b-nand-rootfs.ubi"
           sudo mkfs.ubifs \
             --min-io-size 8192 \
-            --leb-size 2080768 \
-            --max-leb-cnt 2032 \
+            --leb-size 1032192 \
+            --max-leb-cnt 1984 \
             --compr favor_lzo \
             --favor-percent 20 \
             --root "$rootfs_dir" \
@@ -957,7 +1044,7 @@ jobs:
           } > "$ubinize_ini"
           sudo ubinize \
             --output "$ubi" \
-            --peb-size 2097152 \
+            --peb-size 1048576 \
             --min-io-size 8192 \
             --sub-page-size 8192 \
             --vid-hdr-offset 8192 \
@@ -966,7 +1053,9 @@ jobs:
           sudo chown -R "$USER:$USER" "$payload_dir"
 
           rootfs_bytes=$(stat -c %s "$ubi")
-          ((rootfs_bytes > 0 && rootfs_bytes % 2097152 == 0))
+          ((rootfs_bytes > 0 && rootfs_bytes % 1048576 == 0))
+          bootfit_bytes=$(stat -c %s "$boot_fit")
+          ((bootfit_bytes > 0 && bootfit_bytes <= 67108864))
           spl_bytes=$(stat -c %s "$payload_dir/pcduino3b-nand-spl-with-ecc.bin")
           ((spl_bytes > 0 && spl_bytes % 8832 == 0))
           uboot_bytes=$(stat -c %s "$payload_dir/pcduino3b-nand-u-boot.bin")
@@ -974,7 +1063,7 @@ jobs:
 
           manifest="$payload_dir/pcduino3b-nand-manifest.txt"
           {
-            echo 'FORMAT_VERSION=1'
+            echo 'FORMAT_VERSION=2'
             echo 'BOARD=pcduino3b'
             echo 'BOARD_NAME=pcDuino3B'
             echo 'PROFILE=nand-rootfs'
@@ -988,7 +1077,20 @@ jobs:
             echo 'SPL_PRIMARY_OFFSET=0x00000000'
             echo 'SPL_BACKUP_OFFSET=0x00400000'
             echo 'UBOOT_OFFSET=0x00800000'
-            echo 'UBI_OFFSET=0x02000000'
+            echo 'BOOTFIT_OFFSET=0x02000000'
+            echo 'BOOTFIT_REGION_BYTES=100663296'
+            echo 'BOOTFIT_READ_BYTES=67108864'
+            echo "BOOTFIT_BYTES=$bootfit_bytes"
+            echo 'ROOTFS_PHYSICAL_OFFSET=0x08000000'
+            echo 'ROOTFS_SLC_EMULATION=dist6'
+            echo 'ROOTFS_AUTO_ATTACH=linux,ubi'
+            echo "FIT_KERNEL_BYTES=$kernel_bytes"
+            echo "FIT_INITRD_BYTES=$initrd_bytes"
+            echo 'FIT_INITRD_PAYLOAD_COMPRESSION=gzip'
+            echo 'FIT_INITRD_FIT_COMPRESSION=none'
+            echo "FIT_RUNTIME_DTB_BYTES=$runtime_dtb_bytes"
+            echo 'ROOTFS_PEB_BYTES=1048576'
+            echo 'ROOTFS_LEB_BYTES=1032192'
             echo 'UBI_VOLUME=rootfs'
             echo "ROOTFS_UBI_BYTES=$rootfs_bytes"
             echo "SPL_BYTES=$spl_bytes"
@@ -998,6 +1100,7 @@ jobs:
             cd "$payload_dir"
             sha256sum -b \
               pcduino3b-nand-rootfs.ubi \
+              pcduino3b-nand-boot.itb \
               pcduino3b-nand-spl-with-ecc.bin \
               pcduino3b-nand-u-boot.bin \
               pcduino3b-nand-layout.env \
@@ -1017,7 +1120,11 @@ jobs:
           zstd -t "$bundle"
           zstd -dc "$bundle" | tar -tf - | sort
           bundle_sha_file="${bundle}.sha256"
-          sha256sum -b "$bundle" > "$bundle_sha_file"
+          (
+            cd "$(dirname "$bundle")"
+            sha256sum -b "$(basename "$bundle")" \
+              > "$(basename "$bundle_sha_file")"
+          )
 
           {
             echo "bundle=$bundle"
@@ -1026,6 +1133,8 @@ jobs:
             echo "bundle_bytes=$(stat -c %s "$bundle")"
             echo "rootfs_ubi_sha256=$(sha256sum "$ubi" | awk '{print $1}')"
             echo "rootfs_ubi_bytes=$rootfs_bytes"
+            echo "bootfit_sha256=$(sha256sum "$boot_fit" | awk '{print $1}')"
+            echo "bootfit_bytes=$bootfit_bytes"
             echo "seconds=$(( $(date +%s) - started ))"
           } >> "$GITHUB_OUTPUT"
 
@@ -1095,6 +1204,7 @@ jobs:
             echo "REPOSITORY_COMMIT=$GITHUB_SHA"
             echo "ARMBIAN_BUILD_REF=$ARMBIAN_BUILD_REF"
             echo "ARMBIAN_OS_REF=$ARMBIAN_OS_REF"
+            echo "KERNEL_GIT_REF=$KERNEL_GIT_REF"
             echo "PROFILE=${{ steps.config.outputs.profile }}"
             echo "IMAGE=$(basename '${{ steps.compression.outputs.image }}')"
             echo "IMAGE_SHA256=${{ steps.compression.outputs.sha256 }}"
@@ -1111,8 +1221,13 @@ jobs:
             echo 'NAND_OVERLAY=${{ steps.config.outputs.nand_overlay }}'
             if [[ '${{ steps.config.outputs.profile }}' == nand-installer ]]; then
               echo 'NAND_PAYLOAD=PASS'
-              echo 'NAND_LAYOUT_VERSION=1'
-              echo 'NAND_UBI_OFFSET=0x02000000'
+              echo 'NAND_LAYOUT_VERSION=2'
+              echo 'NAND_BOOTFIT_OFFSET=0x02000000'
+              echo 'NAND_BOOTFIT_READ_BYTES=67108864'
+              echo 'NAND_BOOTFIT_SHA256=${{ steps.nand-payload.outputs.bootfit_sha256 }}'
+              echo 'NAND_BOOTFIT_BYTES=${{ steps.nand-payload.outputs.bootfit_bytes }}'
+              echo 'NAND_ROOTFS_PHYSICAL_OFFSET=0x08000000'
+              echo 'NAND_ROOTFS_SLC_EMULATION=dist6'
               echo 'NAND_UBI_VOLUME=rootfs'
               echo 'NAND_ROOTFS_UBI_SHA256=${{ steps.nand-payload.outputs.rootfs_ubi_sha256 }}'
               echo 'NAND_ROOTFS_UBI_BYTES=${{ steps.nand-payload.outputs.rootfs_ubi_bytes }}'
@@ -1179,6 +1294,7 @@ jobs:
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          [[ "$status" == PASS ]] || exit 1
 
       - name: Finalize candidate verification report
         shell: bash
@@ -1279,6 +1395,7 @@ jobs:
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          [[ "$status" == PASS ]] || exit 1
 
       - name: Upload accepted workflow artifact
         id: workflow-artifact

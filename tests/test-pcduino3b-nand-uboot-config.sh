@@ -31,8 +31,13 @@ assert_profile() {
 			'scripts/config --enable CONFIG_MTD_RAW_NAND' \
 			'scripts/config --enable CONFIG_NAND_SUNXI' \
 			'scripts/config --enable CONFIG_CMD_NAND' \
-			'scripts/config --enable CONFIG_CMD_UBI' \
-			'scripts/config --enable CONFIG_CMD_UBIFS' \
+			'scripts/config --disable CONFIG_CMD_UBI' \
+			'scripts/config --disable CONFIG_CMD_UBIFS' \
+			'scripts/config --enable CONFIG_FIT' \
+			'scripts/config --enable CONFIG_FIT_FULL_CHECK' \
+			'scripts/config --enable CONFIG_SHA256' \
+			'scripts/config --enable CONFIG_CMD_BOOTM' \
+			'scripts/config --set-val CONFIG_SYS_BOOTM_LEN 0x04000000' \
 			'scripts/config --set-val CONFIG_NAND_SUNXI_SPL_ECC_STRENGTH 64' \
 			'scripts/config --set-val CONFIG_SYS_NAND_PAGE_SIZE 8192' \
 			'scripts/config --set-val CONFIG_SYS_NAND_OOBSIZE 640' \
@@ -55,14 +60,47 @@ for expected in \
 	'model = "LinkSprite pcDuino3B";' \
 	'phy-mode = "rgmii-id";' \
 	'pcduino3b_nand_pins: nand-pins' \
-	'func(UBIFS, ubifs, 0, ubi, rootfs)' \
+	'int max_oobsize;' \
+	'if (ecc_bytes[ecc_idx] * nsectors + total_user_data_sz >' \
+	'    max_oobsize)' \
 	'label = "spl-primary";' \
 	'label = "spl-backup";' \
 	'label = "uboot";' \
-	'label = "ubi";' \
-	'reg = <0x02000000 0xfe000000>;'; do
+	'label = "bootfit";' \
+	'label = "rootfs";' \
+	'reg = <0x02000000 0x06000000>;' \
+	'reg = <0x08000000 0xf8000000>;'; do
 	grep -Fq "$expected" "$UBOOT_PATCH"
 done
+if grep -Eq '^[ +][[:space:]]*if \(ecc_bytes\[ecc_idx\] \+ total_user_data_sz > max_ecc_bytes\)' \
+	"$UBOOT_PATCH"; then
+	echo 'pcDuino3B U-Boot patch retains the v2026.07 SPL ECC unit mismatch' >&2
+	exit 1
+fi
+
+# Model the fixed v2026.07 SPL probe for this board's 8 KiB page,
+# 640-byte OOB, 1 KiB ECC step and 4 user bytes per step. Index 4 is
+# 40-bit ECC; index 5 is 48-bit and must not fit.
+ecc_bytes=(28 42 50 56 70 84 98 106 112)
+ecc_strengths=(16 24 28 32 40 48 56 60 64)
+nsectors=$((8192 / 1024))
+total_user_data_sz=$((nsectors * 4))
+max_oobsize=640
+max_ecc_idx=-1
+for ecc_idx in "${!ecc_bytes[@]}"; do
+	if ((ecc_bytes[ecc_idx] * nsectors + total_user_data_sz > max_oobsize)); then
+		break
+	fi
+	max_ecc_idx=$ecc_idx
+done
+[[ "$max_ecc_idx" -ge 0 ]]
+[[ "${ecc_strengths[max_ecc_idx]}" -eq 40 ]]
+[[ $((ecc_bytes[max_ecc_idx] * nsectors + total_user_data_sz)) -eq 592 ]]
+[[ $((ecc_bytes[max_ecc_idx + 1] * nsectors + total_user_data_sz)) -eq 704 ]]
+if grep -Fq 'func(UBIFS' "$UBOOT_PATCH"; then
+	echo 'pcDuino3B U-Boot must not read the SLC-emulated rootfs UBI' >&2
+	exit 1
+fi
 if grep -Fq 'diff --git a/arch/arm/dts/sun7i-a20-pcduino3.dts' "$UBOOT_PATCH"; then
 	echo 'pcDuino3B U-Boot patch modifies the upstream pcDuino3 DTS' >&2
 	exit 1
@@ -73,11 +111,15 @@ LAYOUT="$REPO_ROOT/userpatches/overlay/usr/share/pcduino3b/nand-layout.env"
 source "$LAYOUT"
 [[ "$PCDUINO3B_NAND_TOTAL_BYTES" -eq 4294967296 ]]
 [[ "$PCDUINO3B_NAND_UBOOT_OFFSET" -eq 8388608 ]]
-[[ "$PCDUINO3B_NAND_UBI_OFFSET" -eq 33554432 ]]
-[[ "$PCDUINO3B_NAND_UBI_BYTES" -eq 4261412864 ]]
-[[ $((PCDUINO3B_NAND_UBI_OFFSET + PCDUINO3B_NAND_UBI_BYTES)) \
+[[ "$PCDUINO3B_NAND_BOOTFIT_OFFSET" -eq 33554432 ]]
+[[ "$PCDUINO3B_NAND_ROOTFS_OFFSET" -eq 134217728 ]]
+[[ $((PCDUINO3B_NAND_ROOTFS_OFFSET + PCDUINO3B_NAND_ROOTFS_PHYSICAL_BYTES)) \
 	-eq "$PCDUINO3B_NAND_TOTAL_BYTES" ]]
-[[ "$PCDUINO3B_NAND_UBI_LEB_BYTES" \
-	-eq $((PCDUINO3B_NAND_ERASE_BYTES - PCDUINO3B_NAND_UBI_DATA_OFFSET)) ]]
+[[ "$PCDUINO3B_NAND_ROOTFS_LOGICAL_BYTES" \
+	-eq $((PCDUINO3B_NAND_ROOTFS_PHYSICAL_BYTES / 2)) ]]
+[[ "$PCDUINO3B_NAND_ROOTFS_LEB_BYTES" \
+	-eq $((PCDUINO3B_NAND_ROOTFS_PEB_BYTES - PCDUINO3B_NAND_ROOTFS_DATA_OFFSET)) ]]
+printf '%s\n' "${CONFIG_CALLS[@]}" \
+	| grep -Fq 'nand read 0x50000000 0x02000000 0x04000000 && bootm 0x50000000'
 
 echo 'pcduino3b NAND U-Boot config fixture: PASS'
