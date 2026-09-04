@@ -145,6 +145,8 @@ sudo pcduino3b-nand-probe
 
 即使 `/dev/mtd*` 已枚举，第一阶段也只允许读取几何、ECC、坏块标记和制作校验备份；`INSTALLER=NOT_AUTHORIZED` 不会自动改变。实际擦除或写入必须等完整备份完成恢复演练、布局经确认并获得单独授权。
 
+只为启动只读探测时，可用 `pcDuino3B fast NAND recovery repack` 工作流从已通过实体板验收的 SD Release 生成恢复卡。该路径复用原镜像和原内核，只把 recovery DTB、启动选择和探针加入镜像，避免为设备树探测重复完整内核编译。来源 Release 和 SHA-256 会写入候选镜像及验证报告。
+
 NAND 研究产物统一命名为：
 
 - `pcduino3b-nand-installer`
