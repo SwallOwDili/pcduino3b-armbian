@@ -88,7 +88,28 @@ sudo pcduino3b-selftest
 
 完整报告保存在 `/var/log/pcduino3b-selftest-YYYYMMDD-HHMMSS.log`。
 
-## 6. 网络与外设回归
+## 6. 板载 Wi-Fi
+
+镜像同时携带 RTL8188CUS/RTL8188EUS 的主线内核驱动与固件。先确认 USB ID、驱动和扫描能力：
+
+```bash
+lsusb
+iw dev
+sudo iw dev "$(iw dev | awk '$1 == "Interface" { print $2; exit }')" scan | sed -n '1,80p'
+dmesg | grep -Ei 'rtl8xxxu|rtl8192cu|8188(cu|eu)|firmware.*rtl'
+```
+
+常见结果是 `0bda:8176` 绑定 `rtl8192cu`，或 `0bda:8179` 绑定 `rtl8xxxu`。连接无线网络时使用交互式密码输入，避免密码进入 shell 历史：
+
+```bash
+sudo nmcli radio wifi on
+sudo nmcli --ask device wifi connect "你的SSID"
+nmcli -f DEVICE,TYPE,STATE,CONNECTION device
+```
+
+如果没有无线接口，先看 `lsusb` 是否出现 Realtek 设备，再检查 `dmesg` 是否报告 `rtl8192cufw*.bin` 或 `rtl8188eufw.bin` 缺失；不要直接安装来源不明的厂商 DKMS 驱动。
+
+## 7. 网络与外设回归
 
 ```bash
 IFACE="$(ip -4 route show default | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
@@ -111,7 +132,7 @@ lsblk
 sudo pcduino3b-selftest --iperf-server 192.168.1.2
 ```
 
-## 7. 启动排障
+## 8. 启动排障
 
 串口日志重点核对：
 
@@ -121,16 +142,16 @@ sudo pcduino3b-selftest --iperf-server 192.168.1.2
 - `sun7i-dwmac` / `stmmac` 初始化，RTL8211E 位于已验证的 MDIO 地址；
 - 根文件系统仍为 `/dev/mmcblk0p1` microSD ext4 分区。
 
-## 8. NAND 只读研究边界
+## 9. NAND 安装与恢复边界
 
-`nand-installer` 与 `nand-recovery` 是隔离的 Minimal profile 接口，不是已授权的写入工具。普通 `sd-release` 使用 `sun7i-a20-pcduino3b.dtb`，其中 NAND 控制器保持 `disabled`；NAND profile 改用 `sun7i-a20-pcduino3b-nand-recovery.dtb`。
+`nand-installer` 与 `nand-recovery` 是相互隔离的 Minimal profile。三者都保留已经过实体板验收的 `sun7i-a20-pcduino3b.dtb`：普通 `sd-release` 不应用 NAND overlay；recovery 由 U-Boot 应用无分区的 `pcduino3b-nand-recovery.dtbo`；installer 应用固定布局的 `pcduino3b-nand-layout.dtbo`。不再把主机预合成 DTB 直接作为启动 DTB。
 
-2026-09-04 实体板旧测试镜像的只读基线如下：
+2026-09-04 实体板只读探测的最终基线如下：
 
 - live DT 中 `/soc/nand-controller@1c03000` 及 `nand@0` 的状态为 `okay`，片选和 ready/busy 均为 0，ECC mode 为 `hw`；
-- 内核读到 Hynix `0xad:0xd7`，容量 4096 MiB、erase block 2048 KiB、page 4096 B、OOB 128 B；
-- ONFI parameter page 的多数恢复失败，随后 `sunxi_nand` 初始化失败并返回 `-22`；
-- `/proc/mtd` 没有设备，系统只有 `/dev/ubi_ctrl`，所以不存在可安全读取或写入的 raw MTD；
+- 完整 ID 为 `ad d7 94 91 60 44`，芯片是 Hynix `H27UBG8T2C`；
+- ONFI parameter page 无法恢复，通用 Hynix fallback 会错误解码成 4 KiB page / 128 B OOB，并使 `sunxi_nand` 返回 `-22`；
+- 增加精确 ID 表后，`/dev/mtd0` 已在实机枚举为 4096 MiB、8 KiB page、640 B OOB、2 MiB eraseblock、40-bit/1 KiB ECC；
 - raw NAND/sunxi NAND 驱动是模块，UBI/UBIFS 为 built-in。
 
 2026-09-04 当前镜像的实机复测进一步确认：
@@ -138,10 +159,11 @@ sudo pcduino3b-selftest --iperf-server 192.168.1.2
 - 主机 `fdtoverlay` 预合成并直接选中的 recovery DTB 启动后网络不能保持在线；
 - 保留已验收的普通 DTB、改由 U-Boot 应用同一 recovery overlay 后，系统可正常进入 SSH，live DT 中 NAND 状态为 `okay`，GMAC 仍为 `rgmii-id`；
 - `modprobe.blacklist=sunxi_nand` 与 `/etc/modprobe.d` 黑名单均生效，启动期间没有自动探测；
-- 登录后显式执行 `modprobe sunxi_nand`，系统保持在线，并再次识别 Hynix `0xad:0xd7` 及 4 GiB/4 KiB/128 B/2 MiB 几何信息；
-- ONFI 参数页恢复仍失败，驱动返回 `-22`，`/proc/mtd` 为空；证据文件 `/root/pcduino3b-nand-probe-20260904.txt` 的 SHA-256 为 `8c8ca01a6bcb765e8ae54276b3f7b9b52cee05102c0e4a9f93e1c1462156dde7`。
+- 登录后显式加载带精确 ID 的 NAND core 与 `sunxi_nand`，系统保持在线，`/proc/mtd` 和 sysfs 参数均符合 8 KiB / 640 B / 2 MiB / ECC40 的预期；
+- 全盘抽样发现 4 个已有坏块：`0xfe400000`、`0xfe600000`、`0xffc00000`、`0xffe00000`；除前约 28 MiB 的旧引导内容外，其余区域基本为空；
+- 已用 `nanddump --bb=dumpbad -n -o` 完成数据加 OOB 的全盘原始备份，文件大小为 `4,630,511,616` 字节，SHA-256 为 `42e946fff07ebbc0f1a3c4e84c14e99fd57566624b42042edc826c03efeab1d3`。
 
-这证明启用控制器后，阻塞点会从“DT 节点未启用”推进到“NAND 参数/ECC 初始化失败”，但还不能据此确定唯一根因。recovery DTB 只复现经过观测的 CS0、RB0 和硬件 ECC 配置；它不声明 NAND 分区，也不包含 `nand-on-flash-bbt`，避免在几何与旧布局未知时创建持久化 BBT。普通 SD 镜像仍不受影响。
+这证明内核侧 NAND 识别与 ECC 参数问题已经定位并修复。recovery overlay 只复现经过观测的 CS0、RB0 和硬件 ECC 配置；它不声明 NAND 分区，也不包含 `nand-on-flash-bbt`。普通 SD 镜像仍不受影响。
 
 `pcduino3b-nand-probe` 只安装到隔离的 NAND profile，普通 SD 镜像不携带 NAND 工具。快速 recovery 镜像保留已经实机验收的普通 DTB，由 U-Boot 在启动内存中应用 `pcduino3b-nand-recovery.dtbo`；不要安装由主机 `fdtoverlay` 预合成的 DTB。NAND recovery 默认禁止 udev 在启动期间自动加载 `sunxi_nand`，确保网络和 SSH 先进入可观察状态。登录后先确认系统稳定，再显式加载驱动并采集只读证据：
 
@@ -150,9 +172,48 @@ sudo modprobe sunxi_nand
 sudo pcduino3b-nand-probe
 ```
 
-若 raw MTD 仍未枚举，脚本输出 `PROBE_STATUS=NOT_READY`、`INSTALLER=NOT_AUTHORIZED` 并以状态码 3 退出。这不是脚本故障，而是防止在芯片几何、ECC 参数、坏块、分区布局和可恢复备份均未确认前进入写入阶段的安全门。
+若 raw MTD 未枚举，脚本输出 `PROBE_STATUS=NOT_READY`、`INSTALLER=NOT_AUTHORIZED` 并以状态码 3 退出。即使 MTD 已枚举，探针也不会自动进入写入流程。
 
-即使 `/dev/mtd*` 已枚举，第一阶段也只允许读取几何、ECC、坏块标记和制作校验备份；`INSTALLER=NOT_AUTHORIZED` 不会自动改变。实际擦除或写入必须等完整备份完成恢复演练、布局经确认并获得单独授权。
+pcDuino3B 构建仍复用上游 `Linksprite_pcDuino3_defconfig`，但 U-Boot control DT 已独立为 `sun7i-a20-pcduino3b.dts`，运行时 model、RGMII-ID 与新增 NAND 节点均使用 3B 身份，原 `sun7i-a20-pcduino3.dts` 不被修改。NAND profile 会启用 sunxi NAND、MTD、UBI 和 UBIFS，并额外打包 `pcduino3b-nand-spl-with-ecc.bin` 与 `pcduino3b-nand-u-boot.bin`。前者是 Allwinner BROM 可直接读取的 ECC/randomizer 编码 SPL。U-Boot 的启动目标按 `microSD -> NAND UBI` 排列：插着 installer/recovery 卡时总是优先走救援系统；移除卡后才挂载 NAND 的 `ubi:rootfs` 并扫描 `/boot/boot.scr`。
+
+固定布局版本 1 如下，所有边界均按 2 MiB eraseblock 对齐：
+
+| 区域 | 起始 | 大小 | 写入方式 |
+| --- | ---: | ---: | --- |
+| `spl-primary` | `0x00000000` | 4 MiB | 预编码 data+OOB，raw/no-ECC |
+| `spl-backup` | `0x00400000` | 4 MiB | 预编码 data+OOB，raw/no-ECC |
+| `uboot` | `0x00800000` | 24 MiB 保留区 | Linux NAND ECC/randomizer；镜像最多 768 KiB |
+| `ubi` | `0x02000000` | 4064 MiB | `ubiformat` 写入动态、自动扩容的 `rootfs` volume |
+
+`image-build` 的 `nand-installer` profile 会同时生成 SD 候选镜像和 `pcduino3b-nand-installer-<run>.tar.zst`。后者包含 CI 从同一已验收 rootfs 生成的 `pcduino3b-nand-rootfs.ubi`、两段引导文件、layout overlay、安装器、manifest 和内部 `SHA256SUMS`。UBIFS 参数固定为 8192 B min-I/O、2080768 B LEB、最多 2032 LEB，压缩只使用 U-Boot 同样支持的 LZO/ZLIB 组合。
+
+安装器不带参数运行时只检查并打印计划，不写 NAND：
+
+```bash
+sudo pcduino3b-nand-install --payload-dir /root/pcduino3b-nand-payload
+```
+
+实际写入必须同时满足：从 microSD 启动、profile 为 `nand-installer`、完整 NAND ID/几何正确、三个 boot 分区均无坏块、bundle 内部 SHA-256 全部通过、主机上的 data+OOB 备份 SHA-256 与已记录基线一致，并提供完整确认 token。当前实体板基线备份为：
+
+```text
+bytes  = 4630511616
+sha256 = 42e946fff07ebbc0f1a3c4e84c14e99fd57566624b42042edc826c03efeab1d3
+```
+
+满足这些条件后使用：
+
+```bash
+sudo pcduino3b-nand-install \
+  --install \
+  --payload-dir /root/pcduino3b-nand-payload \
+  --backup-sha256 42e946fff07ebbc0f1a3c4e84c14e99fd57566624b42042edc826c03efeab1d3 \
+  --host-backup-confirmed \
+  --confirm ERASE-PCDUINO3B-NAND-add794916044
+```
+
+写入顺序是 UBI rootfs、备用 SPL、U-Boot、主 SPL。每一步都在进入下一步前做读回比较；UBI 会重新挂载为只读并检查 Noble、`nand-rootfs` 身份、内核、initrd、boot script、DTB 与 overlay。脚本成功后不会自动重启，先保存 `/var/log/pcduino3b-nand-install-*.log`，再关机、拔出 microSD 并测试 NAND 启动。若失败，重新插入 recovery SD；不要在未确认日志和分区状态时重复整片擦除。
+
+安装链路虽已实现并有静态/镜像验收门，但在 CI 产物写入这块实体板并完成拔卡启动、SSH、千兆网及 `pcduino3b-selftest` 之前，发布状态仍必须保持 `HARDWARE_ACCEPTANCE=PENDING`。
 
 只为启动只读探测时，可用 `pcDuino3B fast NAND recovery repack` 工作流从已通过实体板验收的 SD Release 生成恢复卡。该路径复用原镜像和原内核，只把 recovery DTB、启动选择和探针加入镜像，避免为设备树探测重复完整内核编译。来源 Release 和 SHA-256 会写入候选镜像及验证报告。
 

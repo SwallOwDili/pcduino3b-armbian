@@ -42,27 +42,35 @@ rg -n -i --hidden --glob '!.git/**' \
 
 ## 整改后允许引用清单
 
-整改后同一表达式（排除本报告自身）共返回 333 行。以下按文件聚合，每个命中都落入对应行的分类；数字用于防止漏扫新文件，并不把同一行内的多个关键词重复计数。
+整改后同一表达式（排除本报告自身）共返回 723 行。以下按文件聚合，每个命中都落入对应行的分类；数字用于防止漏扫新文件，并不把同一行内的多个关键词重复计数。
 
 | 文件 | 命中行 | 分类 | 说明 |
 | --- | ---: | --- | --- |
-| `.github/workflows/image-build.yml` | 45 | 1、2、3 | 当前 board/artifact/验收身份；原板 DT 只用于无污染回归。 |
-| `.github/workflows/preflight.yml` | 37 | 1、2、3、4 | 三条内核线的板型解析与 current DTB；原 DTS/defconfig 是兼容验收。 |
+| `.github/workflows/image-build.yml` | 107 | 1、2、3、4 | 当前 board/artifact/镜像验收与隔离 NAND bundle；原板 DT 只用于无污染回归，旧 U-Boot 名只作内部兼容。 |
+| `.github/workflows/nand-recovery-repack.yml` | 32 | 1、2、3 | 当前 recovery 候选、运行时 overlay 与基准 DTB；不会改变当前产品身份。 |
+| `.github/workflows/preflight.yml` | 70 | 1、2、3、4 | 三条内核线的板型解析、current DTB、NAND ID/layout 与 U-Boot 内部兼容验收。 |
 | `.github/workflows/release-promotion.yml` | 6 | 1、2 | 当前候选 tag、实体板和发布身份。 |
-| `README.md` | 13 | 1、2、3、4 | 当前用户身份及明确标注的底层兼容说明。 |
-| `docs/INSTALL.md` | 32 | 1、2、5 | 当前安装/验收身份；旧包只作 legacy 边界说明。 |
-| `BUILD-PERFORMANCE.md` | 4 | 1、2 | 当前项目和 cache key。 |
+| `README.md` | 16 | 1、2、3、4 | 当前用户身份、Wi-Fi/NAND 状态及明确标注的底层兼容说明。 |
+| `docs/INSTALL.md` | 42 | 1、2、4、5 | 当前 SD/NAND 安装和验收身份；旧包只作 legacy 边界说明。 |
+| `BUILD-PERFORMANCE.md` | 8 | 1、2 | 当前项目、profile 和 cache key。 |
 | `packages/common.txt` | 1 | 1 | 注释中的当前展示名称；其它清单无被审计名称。 |
-| `userpatches/config/boards/pcduino3b.csc` | 6 | 2、3、4 | 当前 board/DTB、sun7i family、共享 U-Boot defconfig。 |
-| `userpatches/customize-image.sh` | 18 | 1、2 | 构建 target、hostname、hosts、build-info 与 profile。 |
-| `userpatches/extensions/pcduino3b-gigabit.sh` | 8 | 2 | 当前板专用扩展名、profile 软件包和隔离的 NAND 文件名后缀。 |
-| `sunxi-6.12`、`sunxi-6.18`、`sunxi-7.1` kernel patches | 48 | 1、2、3 | 三条内核线的同源新 DTS/model/DTB；原 DTS、compatible、Nano DTB 行只是 include/说明/Makefile 上下文。 |
+| `userpatches/config/boards/pcduino3b.csc` | 11 | 2、3、4 | 当前 board/DTB、sun7i family、共享 U-Boot defconfig、独立 3B control DT 与隔离 NAND 配置。 |
+| `userpatches/customize-image.sh` | 23 | 1、2 | 构建 target、hostname、hosts、build-info、Wi-Fi/NAND profile。 |
+| `userpatches/dts/*nand*.dtso` | 14 | 2、3 | 当前板 recovery/layout overlay；`compatible=fixed-partitions` 是标准分区绑定。 |
+| `userpatches/extensions/pcduino3b-gigabit.sh` | 14 | 2 | 当前板专用扩展、Wi-Fi 保证、profile 后缀及 NAND U-Boot 产物名。 |
+| 三条 `0001` kernel patches | 84 | 1、2、3 | 三条内核线的同源新 DTS/model/DTB；原 DTS、compatible、Nano DTB 行只是 include/说明/Makefile 上下文。 |
+| 三条 `0002` kernel patches | 6 | 2、3 | 同一实机 NAND 精确 ID 表修复，不生成旧板身份。 |
+| `userpatches/u-boot/**` | 20 | 2、3、4 | 只对 pcduino3b board patch 目录生效；新增独立 `sun7i-a20-pcduino3b.dts` 与 3B 前缀 NAND 节点，只把上游 pcDuino3 defconfig/DTS 作为兼容基础。 |
 | `pcduino3b-selftest` | 41 | 1、2 | 当前运行身份及其严格期望值。 |
-| `pcduino3b-nand-probe` | 9 | 1、2、3 | 当前工具名；`compatible` 仅为只读 DT 字段输出。 |
-| `scripts/check-pcduino3b-identity.sh` | 28 | 1～6 | 身份 allow/deny、三内核线一致性规则本身，不生成产品身份。 |
+| `pcduino3b-nand-probe` | 14 | 1、2、3 | 当前工具名；`compatible` 仅为只读 DT 字段输出。 |
+| `pcduino3b-nand-install` 与 layout env | 58 | 1、2 | 当前板固定 NAND 几何、备份凭证、分区名和多重安全门。 |
+| `scripts/check-pcduino3b-identity.sh` | 51 | 1～6 | 身份 allow/deny、三内核线、U-Boot control DT 与 NAND overlay 一致性规则本身，不生成产品身份。 |
 | `tests/test-pcduino3b-selftest.sh` | 23 | 1、2 | 当前身份 fixture，并覆盖实机缺失 PHY name 文件的场景。 |
-| `tests/test-pcduino3b-nand-probe.sh` | 7 | 1、2 | 当前工具与隔离测试 fixture。 |
-| `tests/test-pcduino3b-profile-suffix.sh` | 7 | 1、2 | 当前 profile、软件包注入与 NAND 文件名隔离 fixture。 |
+| `tests/test-pcduino3b-nand-probe.sh` | 19 | 1、2 | 当前工具、精确 NAND 几何与隔离测试 fixture。 |
+| `tests/test-pcduino3b-nand-installer.sh` | 14 | 1、2 | 固定布局、备份、安全确认与禁止整片写入 fixture。 |
+| `tests/test-pcduino3b-nand-uboot-config.sh` | 23 | 2、4 | 独立 3B control DT、NAND U-Boot 配置、产物、分区与 SD 优先顺序 fixture。 |
+| `tests/test-pcduino3b-profile-suffix.sh` | 20 | 1、2 | 当前 profile、软件包注入与 NAND 文件名隔离 fixture。 |
+| `tests/test-pcduino3b-wifi-config.sh` | 6 | 1、2 | 当前板 Wi-Fi 驱动、固件和 NetworkManager 策略 fixture。 |
 
 | 路径 | 允许名称 | 分类 | 边界 |
 | --- | --- | ---: | --- |
@@ -71,6 +79,7 @@ rg -n -i --hidden --glob '!.git/**' \
 | `userpatches/config/boards/pcduino3b.csc` | `BOARD_NAME="pcDuino3B"`、`BOOT_FDT_FILE=...pcduino3b.dtb` | 2 | 决定 Armbian slug、用户可见名称和正式 DTB。 |
 | 同一 board 文件 | `BOARDFAMILY="sun7i"` | 3 | 上游 Allwinner A20 family，不能改成产品名。 |
 | 同一 board 文件 | `BOOTCONFIG="Linksprite_pcDuino3_defconfig"` | 4 | 允许复用的 U-Boot 内部配置，不能泄漏成产品身份。 |
+| 同一 board 文件 | `CONFIG_DEFAULT_DEVICE_TREE/CONFIG_OF_LIST="sun7i-a20-pcduino3b"` | 2 | 即使复用上游 defconfig，U-Boot 运行时也必须选择独立 3B control DT。 |
 | kernel patch 新 DTS | `#include "sun7i-a20-pcduino3.dts"`、`linksprite,pcduino3` fallback | 3 | 上游兼容基础；原 DTS 保持原行为。 |
 | kernel patch 新 DTS | `model = "LinkSprite pcDuino3B"`、`sun7i-a20-pcduino3b.dtb` | 1、2 | 当前板唯一最终 model/DTB。 |
 | kernel patch Makefile 上下文 | `sun7i-a20-pcduino3-nano.dtb` | 3 | 只是上游 Makefile 相邻条目，不代表当前板；不可用于当前 boot 选择。 |
@@ -100,7 +109,7 @@ rg -n -i --hidden --glob '!.git/**' \
 | `compatible =` | 新 DTS 继承已注册的上游兼容链，不虚构未注册的 3B compatible。 |
 | `armbian_board:` | 基线 Action wrapper 的旧值为分类 6；当前 direct-compile workflow 等价传入 `BOARD=pcduino3b`，若再使用 wrapper 必须传 `pcduino3b`。 |
 | `BOOT_FDT_FILE` | board 配置必须选择 `allwinner/sun7i-a20-pcduino3b.dtb`。 |
-| `fdtfile` | 仓库不手工覆写；由正式 board/boot 配置机制生成，workflow 只验收其最终值。 |
+| `fdtfile` | 正式 board 配置生成独立基准 DTB；NAND workflow 只把它规范化为同一基准值并追加经 CI 编译/合成验收的 profile overlay。 |
 | `sun7i-a20-pcduino3` | 带 `b` 的 DTB 是当前成品；不带 `b` 的 DTS 仅为上游 include/兼容验证。 |
 | `Linksprite_pcDuino3_defconfig` | 分类 4，允许作为 U-Boot 内部兼容配置。 |
 

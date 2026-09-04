@@ -6,3 +6,4 @@ parted
 rsync
 u-boot-tools
 util-linux
+zstd

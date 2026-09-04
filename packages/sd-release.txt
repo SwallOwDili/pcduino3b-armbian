@@ -2,8 +2,6 @@
 htop
 i2c-tools
 iperf3
-iw
 jq
 lsof
 smartmontools
-usbutils

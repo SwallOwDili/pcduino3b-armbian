@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pcDuino3B Armbian CI <noreply@github.com>
+Date: Fri, 4 Sep 2026 18:00:00 +0800
+Subject: [PATCH] mtd: rawnand: add Hynix H27UBG8T2C identification
+
+The onboard 4 GiB NAND on pcDuino3B reports the six-byte ID
+ad d7 94 91 60 44 and does not provide a recoverable ONFI parameter
+page.  Generic Hynix ID decoding consequently reports a false 4 KiB
+page and 128-byte OOB geometry.
+
+Add the exact ID with the geometry verified on hardware: 8 KiB pages,
+640-byte OOB, 2 MiB eraseblocks and 40-bit ECC per 1 KiB step.
+---
+ drivers/mtd/nand/raw/nand_ids.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/mtd/nand/raw/nand_ids.c b/drivers/mtd/nand/raw/nand_ids.c
+--- a/drivers/mtd/nand/raw/nand_ids.c
++++ b/drivers/mtd/nand/raw/nand_ids.c
+@@ -45,6 +45,10 @@ struct nand_flash_dev nand_flash_ids[] = {
+ 	{"TC58NVG6D2 64G 3.3V 8-bit",
+ 		{ .id = {0x98, 0xde, 0x94, 0x82, 0x76, 0x56, 0x04, 0x20} },
+ 		  SZ_8K, SZ_8K, SZ_2M, 0, 8, 640, NAND_ECC_INFO(40, SZ_1K) },
++	{"H27UBG8T2CTR-BC 32G 3.3V 8-bit",
++		{ .id = {0xad, 0xd7, 0x94, 0x91, 0x60, 0x44} },
++		  SZ_8K, SZ_4K, SZ_2M, NAND_NEED_SCRAMBLING, 6, 640,
++		  NAND_ECC_INFO(40, SZ_1K) },
+ 	{"SDTNQGAMA 64G 3.3V 8-bit",
+ 		{ .id = {0x45, 0xde, 0x94, 0x93, 0x76, 0x57} },
+ 		  SZ_16K, SZ_8K, SZ_4M, 0, 6, 1280, NAND_ECC_INFO(40, SZ_1K) },
+-- 
+2.51.0

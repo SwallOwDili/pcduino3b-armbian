@@ -1,0 +1,296 @@
+#!/bin/bash
+# Install an accepted pcDuino3B NAND payload from a microSD recovery system.
+
+set -euo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LAYOUT_FILE=/usr/share/pcduino3b/nand-layout.env
+PAYLOAD_DIR=/root/pcduino3b-nand-payload
+MODE=plan
+CONFIRM_TOKEN=
+BACKUP_SHA256=
+HOST_BACKUP_CONFIRMED=no
+MOUNT_DIR=
+ATTACHED_MTD=
+
+usage() {
+	cat <<'USAGE'
+Usage:
+  pcduino3b-nand-install [--payload-dir DIR]
+  pcduino3b-nand-install --install --payload-dir DIR \
+    --backup-sha256 HEX --host-backup-confirmed \
+    --confirm ERASE-PCDUINO3B-NAND-add794916044
+
+Without --install the command performs validation and prints the write plan.
+The install mode erases only the fixed NAND partitions declared by the
+pcduino3b-nand-layout overlay. It never writes a whole-disk block device.
+USAGE
+}
+
+die() {
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+need_command() {
+	command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+read_one_line() {
+	tr -d '\0\n' <"$1" 2>/dev/null || true
+}
+
+find_mtd_by_label() {
+	local expected="$1" path label found=
+	for path in /sys/class/mtd/mtd[0-9]*; do
+		[[ -d "$path" ]] || continue
+		label="$(read_one_line "$path/name")"
+		[[ "$label" == "$expected" ]] || continue
+		[[ -z "$found" ]] || die "duplicate MTD partition label: $expected"
+		found="/dev/${path##*/}"
+	done
+	[[ -n "$found" ]] || die "MTD partition is missing: $expected"
+	printf '%s\n' "$found"
+}
+
+sysfs_value() {
+	local device_name="${1#/dev/}"
+	read_one_line "/sys/class/mtd/$device_name/$2"
+}
+
+expect_value() {
+	local actual="$1" expected="$2" description="$3"
+	[[ "$actual" == "$expected" ]] || \
+		die "$description mismatch: got '$actual', expected '$expected'"
+}
+
+cleanup() {
+	set +e
+	if [[ -n "$MOUNT_DIR" ]] && mountpoint -q "$MOUNT_DIR"; then
+		umount "$MOUNT_DIR"
+	fi
+	if [[ -n "$ATTACHED_MTD" ]]; then
+		ubidetach /dev/ubi_ctrl -m "$ATTACHED_MTD" >/dev/null 2>&1
+	fi
+	[[ -n "$MOUNT_DIR" ]] && rmdir "$MOUNT_DIR" 2>/dev/null
+}
+
+while (($#)); do
+	case "$1" in
+		--install)
+			MODE=install
+			shift
+			;;
+		--payload-dir)
+			(($# >= 2)) || die '--payload-dir needs a value'
+			PAYLOAD_DIR="$2"
+			shift 2
+			;;
+		--backup-sha256)
+			(($# >= 2)) || die '--backup-sha256 needs a value'
+			BACKUP_SHA256="$2"
+			shift 2
+			;;
+		--host-backup-confirmed)
+			HOST_BACKUP_CONFIRMED=yes
+			shift
+			;;
+		--confirm)
+			(($# >= 2)) || die '--confirm needs a value'
+			CONFIRM_TOKEN="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown argument: $1"
+			;;
+	esac
+done
+
+[[ $EUID -eq 0 ]] || die 'run as root'
+[[ -r "$LAYOUT_FILE" ]] || die "layout file is missing: $LAYOUT_FILE"
+# This file is installed from the same immutable image as this program and
+# contains only numeric/string assignments validated by CI.
+# shellcheck disable=SC1091
+source "$LAYOUT_FILE"
+
+need_command findmnt
+need_command flash_erase
+need_command nanddump
+need_command nandwrite
+need_command sha256sum
+need_command ubiattach
+need_command ubidetach
+need_command ubiformat
+need_command ubinfo
+
+MODEL="$(read_one_line /proc/device-tree/model)"
+expect_value "$MODEL" 'LinkSprite pcDuino3B' 'device-tree model'
+ROOT_SOURCE="$(findmnt -n -o SOURCE /)"
+[[ "$ROOT_SOURCE" == /dev/mmcblk*p* ]] || \
+	die "installer must run from microSD, current root is $ROOT_SOURCE"
+
+PROFILE="$(awk -F= '$1 == "IMAGE_PROFILE" { print $2; exit }' \
+	/etc/pcduino3b-build-info 2>/dev/null || true)"
+expect_value "$PROFILE" nand-installer 'image profile'
+grep -Fq 'H27UBG8T2CTR-BC' /proc/mtd /var/log/kern.log 2>/dev/null || \
+	dmesg | grep -F 'H27UBG8T2CTR-BC' >/dev/null || \
+	die 'the exact H27UBG8T2CTR-BC NAND ID was not observed'
+
+SPL_PRIMARY_DEV="$(find_mtd_by_label spl-primary)"
+SPL_BACKUP_DEV="$(find_mtd_by_label spl-backup)"
+UBOOT_DEV="$(find_mtd_by_label uboot)"
+UBI_DEV="$(find_mtd_by_label ubi)"
+
+expect_value "$(sysfs_value "$SPL_PRIMARY_DEV" size)" \
+	"$PCDUINO3B_NAND_SPL_REGION_BYTES" 'primary SPL partition size'
+expect_value "$(sysfs_value "$SPL_BACKUP_DEV" size)" \
+	"$PCDUINO3B_NAND_SPL_REGION_BYTES" 'backup SPL partition size'
+expect_value "$(sysfs_value "$UBOOT_DEV" size)" \
+	"$PCDUINO3B_NAND_UBOOT_REGION_BYTES" 'U-Boot partition size'
+expect_value "$(sysfs_value "$UBI_DEV" size)" \
+	"$PCDUINO3B_NAND_UBI_BYTES" 'UBI partition size'
+for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV" "$UBI_DEV"; do
+	expect_value "$(sysfs_value "$device" erasesize)" \
+		"$PCDUINO3B_NAND_ERASE_BYTES" "$device erase size"
+	expect_value "$(sysfs_value "$device" writesize)" \
+		"$PCDUINO3B_NAND_PAGE_BYTES" "$device page size"
+	expect_value "$(sysfs_value "$device" oobsize)" \
+		"$PCDUINO3B_NAND_OOB_BYTES" "$device OOB size"
+done
+for device in "$SPL_PRIMARY_DEV" "$SPL_BACKUP_DEV" "$UBOOT_DEV"; do
+	expect_value "$(sysfs_value "$device" bad_blocks)" 0 \
+		"$device boot-region bad-block count"
+done
+
+[[ -d "$PAYLOAD_DIR" ]] || die "payload directory is missing: $PAYLOAD_DIR"
+SPL_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-spl-with-ecc.bin"
+UBOOT_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-u-boot.bin"
+ROOTFS_IMAGE="$PAYLOAD_DIR/pcduino3b-nand-rootfs.ubi"
+for file in "$SPL_IMAGE" "$UBOOT_IMAGE" "$ROOTFS_IMAGE" \
+	"$PAYLOAD_DIR/SHA256SUMS" "$PAYLOAD_DIR/pcduino3b-nand-layout.env"; do
+	[[ -s "$file" ]] || die "payload file is missing or empty: $file"
+done
+cmp -s "$LAYOUT_FILE" "$PAYLOAD_DIR/pcduino3b-nand-layout.env" || \
+	die 'payload layout does not match the running installer'
+(
+	cd "$PAYLOAD_DIR"
+	sha256sum -c SHA256SUMS
+)
+
+SPL_BYTES="$(stat -c %s "$SPL_IMAGE")"
+UBOOT_BYTES="$(stat -c %s "$UBOOT_IMAGE")"
+ROOTFS_BYTES="$(stat -c %s "$ROOTFS_IMAGE")"
+PHYSICAL_PAGE_BYTES=$((PCDUINO3B_NAND_PAGE_BYTES + PCDUINO3B_NAND_OOB_BYTES))
+((SPL_BYTES > 0 && SPL_BYTES % PHYSICAL_PAGE_BYTES == 0)) || \
+	die "SPL raw image size is not a whole data+OOB page: $SPL_BYTES"
+((UBOOT_BYTES > 0 && UBOOT_BYTES <= PCDUINO3B_NAND_UBOOT_MAX_BYTES)) || \
+	die "U-Boot image is outside the accepted size range: $UBOOT_BYTES"
+((ROOTFS_BYTES > 0 && ROOTFS_BYTES % PCDUINO3B_NAND_ERASE_BYTES == 0)) || \
+	die "UBI image is not PEB-aligned: $ROOTFS_BYTES"
+SPL_PAGES=$((SPL_BYTES / PHYSICAL_PAGE_BYTES))
+SPL_DATA_BYTES=$((SPL_PAGES * PCDUINO3B_NAND_PAGE_BYTES))
+
+cat <<PLAN
+pcDuino3B NAND installation plan
+  root source:       $ROOT_SOURCE
+  NAND ID:           $PCDUINO3B_NAND_ID
+  primary SPL:       $SPL_PRIMARY_DEV (offset 0x00000000)
+  backup SPL:        $SPL_BACKUP_DEV (offset 0x00400000)
+  U-Boot:            $UBOOT_DEV (offset 0x00800000)
+  UBI rootfs:        $UBI_DEV (offset 0x02000000)
+  SPL physical pages:$SPL_PAGES
+  U-Boot bytes:      $UBOOT_BYTES
+  UBI image bytes:   $ROOTFS_BYTES
+  UBI bad blocks:    $(sysfs_value "$UBI_DEV" bad_blocks)
+PLAN
+
+if [[ "$MODE" == plan ]]; then
+	echo 'PLAN_STATUS=PASS'
+	echo 'NAND_WRITE=NOT_REQUESTED'
+	exit 0
+fi
+
+[[ "$CONFIRM_TOKEN" == "ERASE-PCDUINO3B-NAND-$PCDUINO3B_NAND_ID" ]] || \
+	die 'destructive confirmation token is missing or incorrect'
+[[ "$BACKUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+	die 'a verified 64-character --backup-sha256 is required'
+expect_value "$BACKUP_SHA256" "$PCDUINO3B_NAND_BASELINE_BACKUP_SHA256" \
+	'host backup SHA-256'
+[[ "$HOST_BACKUP_CONFIRMED" == yes ]] || \
+	die '--host-backup-confirmed is required'
+[[ ! -e /sys/class/ubi/ubi0 ]] || \
+	die 'a UBI device is already attached; detach it before installation'
+
+LOG_FILE="/var/log/pcduino3b-nand-install-$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "BACKUP_SHA256=$BACKUP_SHA256"
+echo 'HOST_BACKUP_CONFIRMED=yes'
+echo "PAYLOAD_SHA256=$(sha256sum "$PAYLOAD_DIR/SHA256SUMS" | awk '{print $1}')"
+
+MOUNT_DIR="$(mktemp -d /run/pcduino3b-nand-rootfs.XXXXXX)"
+trap cleanup EXIT INT TERM
+
+echo 'PHASE=write-ubi-rootfs'
+ubiformat "$UBI_DEV" --yes --flash-image "$ROOTFS_IMAGE"
+UBI_MTD_NUM="${UBI_DEV#/dev/mtd}"
+ubiattach /dev/ubi_ctrl -m "$UBI_MTD_NUM"
+ATTACHED_MTD="$UBI_MTD_NUM"
+for _ in {1..30}; do
+	[[ -e /dev/ubi0_0 ]] && break
+	sleep 1
+done
+[[ -e /dev/ubi0_0 ]] || die 'UBI rootfs volume did not appear'
+ubinfo -a
+mount -t ubifs -o ro ubi0:rootfs "$MOUNT_DIR"
+grep -qx 'VERSION_CODENAME=noble' "$MOUNT_DIR/etc/os-release"
+grep -qx 'ARMBIAN_BOARD=pcduino3b' "$MOUNT_DIR/etc/pcduino3b-build-info"
+grep -qx 'IMAGE_PROFILE=nand-rootfs' "$MOUNT_DIR/etc/pcduino3b-build-info"
+grep -qx 'rootdev=ubi0:rootfs' "$MOUNT_DIR/boot/armbianEnv.txt"
+grep -qx 'rootfstype=ubifs' "$MOUNT_DIR/boot/armbianEnv.txt"
+grep -Eq '^extraargs=.*ubi\.mtd=ubi([[:space:]]|$)' \
+	"$MOUNT_DIR/boot/armbianEnv.txt"
+test -s "$MOUNT_DIR/boot/boot.scr"
+test -s "$MOUNT_DIR/boot/zImage"
+test -s "$MOUNT_DIR/boot/uInitrd"
+test -s "$MOUNT_DIR/boot/overlay-user/pcduino3b-nand-layout.dtbo"
+umount "$MOUNT_DIR"
+ubidetach /dev/ubi_ctrl -m "$UBI_MTD_NUM"
+ATTACHED_MTD=
+
+verify_raw_spl() {
+	local device="$1" label="$2" readback="$MOUNT_DIR/${label}.raw"
+	nanddump --quiet --bb=dumpbad --noecc --oob \
+		--length "$SPL_DATA_BYTES" --file "$readback" "$device"
+	cmp "$SPL_IMAGE" "$readback"
+}
+
+verify_uboot() {
+	local readback="$MOUNT_DIR/uboot.bin"
+	nanddump --quiet --bb=dumpbad --length "$UBOOT_BYTES" \
+		--file "$readback" "$UBOOT_DEV"
+	cmp "$UBOOT_IMAGE" "$readback"
+}
+
+echo 'PHASE=write-backup-spl'
+flash_erase "$SPL_BACKUP_DEV" 0 0
+nandwrite --noecc --oob "$SPL_BACKUP_DEV" "$SPL_IMAGE"
+verify_raw_spl "$SPL_BACKUP_DEV" spl-backup
+
+echo 'PHASE=write-uboot'
+flash_erase "$UBOOT_DEV" 0 0
+nandwrite --pad "$UBOOT_DEV" "$UBOOT_IMAGE"
+verify_uboot
+
+echo 'PHASE=write-primary-spl'
+flash_erase "$SPL_PRIMARY_DEV" 0 0
+nandwrite --noecc --oob "$SPL_PRIMARY_DEV" "$SPL_IMAGE"
+verify_raw_spl "$SPL_PRIMARY_DEV" spl-primary
+
+sync
+echo 'INSTALL_STATUS=PASS'
+echo "INSTALL_LOG=$LOG_FILE"
+echo 'NEXT_STEP=power_off_remove_sd_and_boot_nand'

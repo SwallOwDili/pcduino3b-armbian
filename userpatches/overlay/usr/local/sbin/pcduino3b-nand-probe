@@ -47,7 +47,8 @@ for mtd_path in "$SYS_ROOT"/class/mtd/mtd[0-9]*; do
 	[[ -d "$mtd_path" ]] || continue
 	MTD_COUNT=$((MTD_COUNT + 1))
 	printf '[%s]\n' "$(basename "$mtd_path")"
-	for field in name type size erasesize writesize subpagesize oobsize numeraseregions; do
+	for field in name type size erasesize writesize subpagesize oobsize \
+		ecc_strength ecc_step_size numeraseregions; do
 		[[ -r "$mtd_path/$field" ]] || continue
 		printf '%s=%s\n' "$field" "$(<"$mtd_path/$field")"
 	done

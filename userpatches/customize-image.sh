@@ -72,12 +72,26 @@ APT
 	if [[ "$IMAGE_PROFILE" == nand-* ]]; then
 		install -D -m 0755 /tmp/overlay/usr/local/sbin/pcduino3b-nand-probe \
 			/usr/local/sbin/pcduino3b-nand-probe
+		install -D -m 0644 /tmp/overlay/usr/share/pcduino3b/nand-layout.env \
+			/usr/share/pcduino3b/nand-layout.env
+	fi
+	if [[ "$IMAGE_PROFILE" == nand-recovery ]]; then
 		# Recovery must reach SSH before the experimental NAND driver is
 		# explicitly loaded under observation.  The blacklist affects modalias
 		# autoloading; an operator can still run `modprobe sunxi_nand` manually.
 		install -d -m 0755 /etc/modprobe.d
 		printf '%s\n' 'blacklist sunxi_nand' \
 			>/etc/modprobe.d/pcduino3b-nand-recovery.conf
+	fi
+	if [[ "$IMAGE_PROFILE" == nand-installer ]]; then
+		install -D -m 0755 /tmp/overlay/usr/local/sbin/pcduino3b-nand-install \
+			/usr/local/sbin/pcduino3b-nand-install
+		# The NAND rootfs needs the raw NAND module before its real root can be
+		# mounted.  Armbian regenerates initramfs after customize-image.sh.
+		install -d -m 0755 /etc/initramfs-tools
+		touch /etc/initramfs-tools/modules
+		grep -Fxq sunxi_nand /etc/initramfs-tools/modules || \
+			printf '%s\n' sunxi_nand >>/etc/initramfs-tools/modules
 	fi
 	normalize_identity
 
