@@ -11,6 +11,14 @@ function extension_prepare_config__pcduino3b_profile_suffix() {
 	esac
 }
 
+function extension_prepare_config__pcduino3b_packages() {
+	local -a profile_packages=()
+
+	[[ -n "${PCDUINO3B_EXTRA_PACKAGES:-}" ]] || return 0
+	read -r -a profile_packages <<<"$PCDUINO3B_EXTRA_PACKAGES"
+	add_packages_to_image "${profile_packages[@]}"
+}
+
 function custom_kernel_config__pcduino3b_gigabit_ethernet() {
 	# Changing any of these options must invalidate Armbian's kernel-config cache.
 	kernel_config_modifying_hashes+=(

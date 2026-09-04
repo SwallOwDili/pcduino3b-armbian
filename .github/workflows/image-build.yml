@@ -332,7 +332,7 @@ jobs:
         shell: bash
         env:
           PCDUINO3B_IMAGE_PROFILE: ${{ steps.config.outputs.profile }}
-          EXTRA_PACKAGES_IMAGE: ${{ steps.config.outputs.extra_packages }}
+          PCDUINO3B_EXTRA_PACKAGES: ${{ steps.config.outputs.extra_packages }}
           BUILD_MINIMAL: ${{ steps.config.outputs.build_minimal }}
           FORCE_KERNEL_REBUILD: ${{ steps.config.outputs.force }}
         run: |
@@ -351,7 +351,7 @@ jobs:
             BUILD_MINIMAL="$BUILD_MINIMAL"
             ENABLE_EXTENSIONS=pcduino3b-gigabit
             COMPRESS_OUTPUTIMAGE=img
-            EXTRA_PACKAGES_IMAGE="$EXTRA_PACKAGES_IMAGE"
+            PCDUINO3B_EXTRA_PACKAGES="$PCDUINO3B_EXTRA_PACKAGES"
             PCDUINO3B_IMAGE_PROFILE="$PCDUINO3B_IMAGE_PROFILE"
             PRIVATE_CCACHE=yes
             SHARE_LOG=yes
