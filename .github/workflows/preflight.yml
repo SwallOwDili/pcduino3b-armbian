@@ -311,7 +311,10 @@ jobs:
           fdtput -t s "$runtime_dtb" "$rootfs_partition" compatible linux,ubi
           [[ "$(fdtget -t s "$runtime_dtb" "$rootfs_partition" compatible)" == linux,ubi ]]
           fdtget -p "$runtime_dtb" "$rootfs_partition" | grep -qx slc-mode
-          ! grep -Fq 'linux,ubi' "$layout_overlay"
+          if grep -Fq 'linux,ubi' "$layout_overlay"; then
+            echo 'Installer overlay must not auto-attach UBI before validation' >&2
+            exit 1
+          fi
 
           fit_dir="$RUNNER_TEMP/pcduino3b-nand-fit-fixture"
           mkdir -p "$fit_dir"
@@ -398,8 +401,11 @@ jobs:
           [[ "$(fdtget -t s "$RUNNER_TEMP/sun7i-a20-pcduino3b-u-boot.dtb" / model)" == 'LinkSprite pcDuino3B' ]]
           [[ "$(fdtget -t s "$RUNNER_TEMP/sun7i-a20-pcduino3b-u-boot.dtb" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
           [[ "$(fdtget -t s "$RUNNER_TEMP/sun7i-a20-pcduino3b-u-boot.dtb" /soc/nand-controller@1c03000 status)" == okay ]]
-          ! grep -Fq 'BOOT_TARGET_DEVICES_UBIFS' \
-            u-boot/include/configs/sunxi-common.h
+          if grep -Fq 'BOOT_TARGET_DEVICES_UBIFS' \
+            u-boot/include/configs/sunxi-common.h; then
+            echo 'U-Boot must not contain the removed UBIFS boot target' >&2
+            exit 1
+          fi
 
       - name: Preflight summary
         if: always()
