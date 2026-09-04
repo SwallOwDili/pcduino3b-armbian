@@ -379,8 +379,11 @@ jobs:
             u-boot/drivers/mtd/nand/raw/nand_ids.c
           grep -Fq 'ecc_bytes[ecc_idx] * nsectors + total_user_data_sz >' \
             u-boot/drivers/mtd/nand/raw/sunxi_nand_spl.c
-          ! grep -Fq 'ecc_bytes[ecc_idx] + total_user_data_sz > max_ecc_bytes' \
-            u-boot/drivers/mtd/nand/raw/sunxi_nand_spl.c
+          if grep -Fq 'ecc_bytes[ecc_idx] + total_user_data_sz > max_ecc_bytes' \
+            u-boot/drivers/mtd/nand/raw/sunxi_nand_spl.c; then
+            echo 'U-Boot still contains the v2026.07 SPL ECC unit mismatch' >&2
+            exit 1
+          fi
           git -C u-boot diff --exit-code -- arch/arm/dts/sun7i-a20-pcduino3.dts
           uboot_dts=u-boot/arch/arm/dts/sun7i-a20-pcduino3b.dts
           grep -Fq 'model = "LinkSprite pcDuino3B";' "$uboot_dts"

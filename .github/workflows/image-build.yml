@@ -858,8 +858,11 @@ jobs:
               fi
               ;;
             dev|sd-release)
-              ! sudo grep -q '^user_overlays=pcduino3b-nand-' \
-                "$mount_dir/boot/armbianEnv.txt"
+              if sudo grep -q '^user_overlays=pcduino3b-nand-' \
+                "$mount_dir/boot/armbianEnv.txt"; then
+                echo 'SD-only image unexpectedly enables a NAND overlay' >&2
+                exit 1
+              fi
               ;;
           esac
 
