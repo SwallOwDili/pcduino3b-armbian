@@ -54,6 +54,8 @@ NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`p
 
 旧测试镜像的只读证据表明：NFC/NAND 节点设为 `okay` 后，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出。隔离的 `sun7i-a20-pcduino3b-nand-recovery.dtb` 只为 NAND profile 启用 CS0/RB0 和硬件 ECC；它不声明分区，也不启用可能创建持久化表的 `nand-on-flash-bbt`。`sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`。
 
+需要快速生成探测卡时，`pcDuino3B fast NAND recovery repack` 工作流直接复用已经实机验收的正式 SD 镜像，只注入经过预检的 recovery DTB 和只读探针。它不调用 Armbian 内核构建、不替换内核，也不改变普通 SD Release；输出仍作为独立的 NAND recovery 候选发布。
+
 ## 板端验收
 
 ```bash

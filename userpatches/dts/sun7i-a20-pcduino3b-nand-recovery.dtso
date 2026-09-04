@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
+/*
+ * Fast recovery-image overlay for the pcDuino3B onboard NAND.
+ * It deliberately defines neither partitions nor an on-flash BBT.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc/pinctrl@1c20800";
+
+		__overlay__ {
+			pcduino3b_nand_pins: nand-pins {
+				pins = "PC0", "PC1", "PC2", "PC5", "PC8", "PC9",
+				       "PC10", "PC11", "PC12", "PC13", "PC14",
+				       "PC15", "PC16";
+				function = "nand0";
+			};
+
+			pcduino3b_nand_cs0_pin: nand-cs0-pin {
+				pins = "PC4";
+				function = "nand0";
+			};
+
+			pcduino3b_nand_rb0_pin: nand-rb0-pin {
+				pins = "PC6";
+				function = "nand0";
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc/nand-controller@1c03000";
+
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&pcduino3b_nand_pins>, <&pcduino3b_nand_cs0_pin>,
+				    <&pcduino3b_nand_rb0_pin>;
+			status = "okay";
+
+			nand@0 {
+				reg = <0>;
+				allwinner,rb = <0>;
+				nand-ecc-mode = "hw";
+			};
+		};
+	};
+};

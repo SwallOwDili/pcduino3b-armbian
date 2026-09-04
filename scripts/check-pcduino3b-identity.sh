@@ -37,6 +37,7 @@ CUSTOMIZE="userpatches/customize-image.sh"
 PATCH_FILE="userpatches/kernel/archive/sunxi-6.18/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
 SELFTEST="userpatches/overlay/usr/local/sbin/pcduino3b-selftest"
 NAND_PROBE="userpatches/overlay/usr/local/sbin/pcduino3b-nand-probe"
+NAND_OVERLAY="userpatches/dts/sun7i-a20-pcduino3b-nand-recovery.dtso"
 
 require_match '^BOARD_NAME="pcDuino3B"$' "$BOARD_FILE" 'BOARD_NAME must be pcDuino3B'
 require_match '^BOARDFAMILY="sun7i"$' "$BOARD_FILE" 'BOARDFAMILY must remain sun7i'
@@ -116,6 +117,15 @@ fi
 require_match 'MODE=READ_ONLY' "$NAND_PROBE" 'NAND probe must declare read-only mode'
 require_match 'PROBE_STATUS=NOT_READY' "$NAND_PROBE" 'NAND probe must expose the NOT_READY safety result'
 require_match 'INSTALLER=NOT_AUTHORIZED' "$NAND_PROBE" 'NAND probe must keep the installer safety gate closed'
+require_match 'target-path = "/soc/nand-controller@1c03000";' "$NAND_OVERLAY" \
+	'fast repack overlay must target the A20 NAND controller explicitly'
+require_match 'allwinner,rb = <0>;' "$NAND_OVERLAY" \
+	'fast repack overlay must use the verified ready/busy line'
+require_match 'nand-ecc-mode = "hw";' "$NAND_OVERLAY" \
+	'fast repack overlay must request hardware ECC'
+if grep -Eq '^[[:space:]]*(nand-on-flash-bbt|partitions)[[:space:]{;]' "$NAND_OVERLAY"; then
+	fail 'fast repack overlay must not declare persistent BBT or a partition map'
+fi
 
 if ((FAILURES > 0)); then
 	printf 'identity lint: %d failure(s)\n' "$FAILURES" >&2

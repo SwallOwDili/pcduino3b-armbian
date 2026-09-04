@@ -1,0 +1,269 @@
+name: pcDuino3B fast NAND recovery repack
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pcduino3b-nand-recovery-repack
+  cancel-in-progress: false
+
+env:
+  BASE_RELEASE_TAG: pcduino3b-sd-release-candidate-33843467845
+  BASE_IMAGE: Armbian-unofficial_26.8.6_Pcduino3b_noble_current_6.18.49.img.xz
+  BASE_IMAGE_SHA256: 16727f898b1f9190e765c23ade94a8c253a0a244e66b7936eaf240111ebe057b
+  OUTPUT_IMAGE: Armbian-unofficial_26.8.6_Pcduino3b_noble_current_6.18.49-nand-recovery.img.xz
+
+jobs:
+  repack:
+    name: Repack accepted SD image without rebuilding the kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Start timer
+        shell: bash
+        run: echo "REPACK_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout recovery payload
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install image and device-tree tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends device-tree-compiler e2fsprogs xz-utils
+
+      - name: Download and verify the physically accepted SD image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$BASE_RELEASE_TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --pattern "$BASE_IMAGE"
+          printf '%s  %s\n' "$BASE_IMAGE_SHA256" "$BASE_IMAGE" | sha256sum -c -
+          xz -t "$BASE_IMAGE"
+
+      - name: Inject recovery DTB and read-only probe
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw_image="${OUTPUT_IMAGE%.xz}"
+          xz -dc "$BASE_IMAGE" > "$raw_image"
+
+          overlay="$RUNNER_TEMP/pcduino3b-nand-recovery.dtbo"
+          dtc_stderr="$RUNNER_TEMP/pcduino3b-nand-recovery-dtc.stderr"
+          dtc -@ -I dts -O dtb \
+            -o "$overlay" \
+            userpatches/dts/sun7i-a20-pcduino3b-nand-recovery.dtso \
+            2> "$dtc_stderr"
+          [[ ! -s "$dtc_stderr" ]] || {
+            cat "$dtc_stderr" >&2
+            exit 1
+          }
+
+          mount_dir="$RUNNER_TEMP/pcduino3b-recovery-root"
+          mkdir -p "$mount_dir"
+          loop_device=''
+          cleanup() {
+            set +e
+            if mountpoint -q "$mount_dir"; then
+              sudo umount "$mount_dir"
+            fi
+            if [[ -n "$loop_device" ]]; then
+              sudo losetup -d "$loop_device"
+            fi
+          }
+          trap cleanup EXIT
+
+          loop_device=$(sudo losetup --find --show --partscan "$raw_image")
+          partition="${loop_device}p1"
+          for _ in {1..20}; do
+            [[ -b "$partition" ]] && break
+            sleep 1
+          done
+          [[ -b "$partition" ]] || {
+            echo "Partition node was not created: $partition" >&2
+            exit 1
+          }
+          sudo mount "$partition" "$mount_dir"
+
+          mapfile -t base_dtbs < <(
+            sudo find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb -print
+          )
+          ((${#base_dtbs[@]} == 1)) || {
+            echo "Expected exactly one pcDuino3B base DTB; found ${#base_dtbs[@]}" >&2
+            exit 1
+          }
+          base_dtb=${base_dtbs[0]}
+          recovery_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-recovery.dtb"
+          fdtoverlay -i "$base_dtb" -o "$recovery_dtb" "$overlay"
+
+          base_nfc=/soc/nand-controller@1c03000
+          recovery_nand=$base_nfc/nand@0
+          [[ "$(fdtget -t s "$base_dtb" / model)" == 'LinkSprite pcDuino3B' ]]
+          [[ "$(fdtget -t s "$base_dtb" "$base_nfc" status)" == disabled ]]
+          [[ "$(fdtget -t s "$recovery_dtb" / model)" == 'LinkSprite pcDuino3B' ]]
+          [[ "$(fdtget -t s "$recovery_dtb" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
+          [[ "$(fdtget -t s "$recovery_dtb" "$base_nfc" status)" == okay ]]
+          [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
+          [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
+          [[ "$(fdtget -t s "$recovery_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
+          if fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
+            echo 'Recovery DTB must not enable persistent on-flash BBT' >&2
+            exit 1
+          fi
+          if fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions; then
+            echo 'Recovery DTB must not declare a partition map' >&2
+            exit 1
+          fi
+
+          recovery_dtb_target="$(dirname "$base_dtb")/sun7i-a20-pcduino3b-nand-recovery.dtb"
+          sudo install -m 0644 "$recovery_dtb" "$recovery_dtb_target"
+          sudo install -m 0755 \
+            userpatches/overlay/usr/local/sbin/pcduino3b-nand-probe \
+            "$mount_dir/usr/local/sbin/pcduino3b-nand-probe"
+
+          boot_env="$mount_dir/boot/armbianEnv.txt"
+          sudo sed -i \
+            's|^fdtfile=.*$|fdtfile=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb|' \
+            "$boot_env"
+          build_info="$mount_dir/etc/pcduino3b-build-info"
+          sudo sed -i 's/^IMAGE_PROFILE=.*$/IMAGE_PROFILE=nand-recovery/' "$build_info"
+          printf '%s\n' \
+            "SOURCE_RELEASE=$BASE_RELEASE_TAG" \
+            "SOURCE_SHA256=$BASE_IMAGE_SHA256" \
+            "REPACK_COMMIT=$GITHUB_SHA" \
+            | sudo tee "$mount_dir/etc/pcduino3b-nand-recovery-source" >/dev/null
+
+          sudo grep -Fxq \
+            'fdtfile=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb' "$boot_env"
+          sudo grep -Fxq 'IMAGE_PROFILE=nand-recovery' "$build_info"
+          sudo test -x "$mount_dir/usr/local/sbin/pcduino3b-nand-probe"
+          sudo fdtget -t s "$recovery_dtb_target" "$base_nfc" status | grep -qx okay
+
+          sync
+          sudo umount "$mount_dir"
+          set +e
+          sudo e2fsck -pf "$partition"
+          fsck_status=$?
+          set -e
+          ((fsck_status <= 1)) || {
+            echo "Filesystem verification failed with status $fsck_status" >&2
+            exit "$fsck_status"
+          }
+          sudo losetup -d "$loop_device"
+          loop_device=''
+          trap - EXIT
+
+          raw_bytes=$(stat -c %s "$raw_image")
+          raw_sha256=$(sha256sum "$raw_image" | awk '{print $1}')
+          {
+            echo "raw_image=$raw_image"
+            echo "raw_bytes=$raw_bytes"
+            echo "raw_sha256=$raw_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compress and verify the recovery image
+        id: compression
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw_image='${{ steps.image.outputs.raw_image }}'
+          xz -T0 -6 --stdout "$raw_image" > "$OUTPUT_IMAGE"
+          xz -t "$OUTPUT_IMAGE"
+          sha_file="$OUTPUT_IMAGE.sha"
+          sha256sum "$OUTPUT_IMAGE" > "$sha_file"
+          {
+            echo "sha256=$(awk 'NR == 1 {print $1}' "$sha_file")"
+            echo "bytes=$(stat -c %s "$OUTPUT_IMAGE")"
+            echo "sha_file=$sha_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish NAND recovery candidate
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          candidate_tag="pcduino3b-nand-recovery-candidate-$GITHUB_RUN_ID"
+          report="CI-VERIFICATION-nand-recovery-$GITHUB_RUN_ID.txt"
+          notes="$RUNNER_TEMP/nand-recovery-notes.md"
+          {
+            echo 'BUILD=PASS'
+            echo 'IMAGE_ACCEPTANCE=PASS'
+            echo 'RELEASE_UPLOAD=PENDING'
+            echo 'HARDWARE_ACCEPTANCE=PENDING'
+            echo 'PROFILE=nand-recovery'
+            echo 'KERNEL_REBUILD=NO'
+            echo "SOURCE_RELEASE=$BASE_RELEASE_TAG"
+            echo "SOURCE_SHA256=$BASE_IMAGE_SHA256"
+            echo "RAW_SHA256=${{ steps.image.outputs.raw_sha256 }}"
+            echo "NAND_CONTROLLER_STATUS=okay"
+            echo 'NAND_PARTITIONS=none'
+            echo 'NAND_ON_FLASH_BBT=disabled'
+            echo 'INSTALLER=NOT_AUTHORIZED'
+          } > "$report"
+          {
+            echo 'Repacked from the exact SD image already accepted on physical pcDuino3B hardware.'
+            echo
+            echo "- Source release: \`$BASE_RELEASE_TAG\`"
+            echo "- Source SHA-256: \`$BASE_IMAGE_SHA256\`"
+            echo '- Kernel rebuild: **not run**'
+            echo '- Added payload: isolated NAND recovery DTB and read-only evidence collector'
+            echo '- NAND partition map: **none**'
+            echo '- Persistent on-flash BBT: **disabled**'
+            echo '- NAND erase/write: **not authorized**'
+          } > "$notes"
+
+          gh release create "$candidate_tag" \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "pcDuino3B NAND recovery candidate $GITHUB_RUN_ID" \
+            --notes-file "$notes" \
+            --prerelease
+          gh release upload "$candidate_tag" \
+            "$OUTPUT_IMAGE" '${{ steps.compression.outputs.sha_file }}' "$report" \
+            -R "$GITHUB_REPOSITORY"
+          sed -i 's/^RELEASE_UPLOAD=PENDING$/RELEASE_UPLOAD=PASS/' "$report"
+          gh release upload "$candidate_tag" "$report" \
+            -R "$GITHUB_REPOSITORY" --clobber
+          {
+            echo "candidate_tag=$candidate_tag"
+            echo "report=$report"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pcduino3b-nand-recovery-${{ github.run_id }}
+          path: |
+            ${{ env.OUTPUT_IMAGE }}
+            ${{ steps.compression.outputs.sha_file }}
+            ${{ steps.release.outputs.report }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          elapsed=$(( $(date +%s) - REPACK_STARTED ))
+          {
+            echo '## pcDuino3B fast NAND recovery repack'
+            echo
+            echo "- Result: **${{ job.status }}**"
+            echo '- Kernel rebuild: **not run**'
+            echo "- Source release: \`$BASE_RELEASE_TAG\`"
+            echo "- Source SHA-256: \`$BASE_IMAGE_SHA256\`"
+            echo "- Recovery SHA-256: \`${{ steps.compression.outputs.sha256 || 'unavailable' }}\`"
+            echo "- Candidate tag: \`${{ steps.release.outputs.candidate_tag || 'not-published' }}\`"
+            echo "- Elapsed: $((elapsed / 60))m $((elapsed % 60))s"
+          } >> "$GITHUB_STEP_SUMMARY"
