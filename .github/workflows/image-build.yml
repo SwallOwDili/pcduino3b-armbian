@@ -430,7 +430,7 @@ jobs:
           sudo mount -o ro "$root_part" "$mount_dir"
 
           sudo grep -qx 'VERSION_CODENAME=noble' "$mount_dir/etc/os-release"
-          [[ "$(sudo tr -d '\n' < "$mount_dir/etc/hostname")" == pcduino3b ]]
+          [[ "$(tr -d '\n' < "$mount_dir/etc/hostname")" == pcduino3b ]]
           sudo grep -Eq '^127\.0\.1\.1[[:space:]]+pcduino3b([[:space:]]|$)' "$mount_dir/etc/hosts"
           sudo grep -qx 'BOARD=pcduino3b' "$mount_dir/etc/armbian-release"
           sudo grep -Eq '^BOARD_NAME="?pcDuino3B"?$' "$mount_dir/etc/armbian-release"
@@ -467,8 +467,10 @@ jobs:
             echo 'Dedicated or compatibility DTB missing' >&2
             exit 1
           }
-          sudo dtc -I dtb -O dts "$dtb" > "$RUNNER_TEMP/pcduino3b-image.dts" 2>/dev/null
-          sudo dtc -I dtb -O dts "$original_dtb" > "$RUNNER_TEMP/pcduino3-image.dts" 2>/dev/null
+          sudo dtc -I dtb -O dts "$dtb" 2>/dev/null \
+            | tee "$RUNNER_TEMP/pcduino3b-image.dts" >/dev/null
+          sudo dtc -I dtb -O dts "$original_dtb" 2>/dev/null \
+            | tee "$RUNNER_TEMP/pcduino3-image.dts" >/dev/null
           grep -Eq 'model = "LinkSprite pcDuino3B";' "$RUNNER_TEMP/pcduino3b-image.dts"
           grep -Eq 'phy-mode = "rgmii-id";' "$RUNNER_TEMP/pcduino3b-image.dts"
           grep -Eq 'model = "LinkSprite pcDuino3";' "$RUNNER_TEMP/pcduino3-image.dts"
@@ -477,11 +479,13 @@ jobs:
 
           raw_bytes=$(stat -c %s "$raw_image")
           raw_sha256=$(sha256sum "$raw_image" | awk '{print $1}')
-          echo "raw_image=$raw_image" >> "$GITHUB_OUTPUT"
-          echo "raw_bytes=$raw_bytes" >> "$GITHUB_OUTPUT"
-          echo "raw_sha256=$raw_sha256" >> "$GITHUB_OUTPUT"
-          echo "root_part=$root_part" >> "$GITHUB_OUTPUT"
-          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          {
+            echo "raw_image=$raw_image"
+            echo "raw_bytes=$raw_bytes"
+            echo "raw_sha256=$raw_sha256"
+            echo "root_part=$root_part"
+            echo "seconds=$(( $(date +%s) - started ))"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Compress accepted image and test stream
         id: compression

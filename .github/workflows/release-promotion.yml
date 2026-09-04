@@ -96,9 +96,11 @@ jobs:
             exit 1
           }
 
-          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-          echo "image_name=$image_name" >> "$GITHUB_OUTPUT"
-          echo "release_url=$(jq -r .url <<< "$release_json")" >> "$GITHUB_OUTPUT"
+          {
+            echo "candidate_sha=$candidate_sha"
+            echo "image_name=$image_name"
+            echo "release_url=$(jq -r .url <<< "$release_json")"
+          } >> "$GITHUB_OUTPUT"
 
           if [[ "$HARDWARE_ACCEPTANCE" != pass ]]; then
             echo "Release left as prerelease because hardware_acceptance=$HARDWARE_ACCEPTANCE"
