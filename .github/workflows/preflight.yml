@@ -1,0 +1,207 @@
+name: pcDuino3B fast preflight
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pcduino3b-preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # This is both the framework source ref and the last composite Action ref
+  # audited by this repository.  The Action is not invoked because that ref's
+  # action.yml unconditionally publishes a GitHub Release after compilation.
+  ARMBIAN_BUILD_REF: 34e66c37211c70ef5cfad9c80dd76389720e19b7
+  LINUX_DTS_REF: v6.18.49
+
+jobs:
+  preflight:
+    name: Static, board and DT preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Start timer
+        shell: bash
+        run: echo "PREFLIGHT_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout customizations
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install lightweight validators
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends device-tree-compiler shellcheck
+
+      - name: Validate workflows and shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run github.com/rhysd/actionlint/cmd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106
+
+          mapfile -d '' shell_files < <(
+            find userpatches scripts tests -type f \
+              \( -name '*.sh' -o -path '*/overlay/usr/local/sbin/pcduino3b-*' \) \
+              -print0 2>/dev/null || true
+          )
+          ((${#shell_files[@]} > 0)) || {
+            echo 'No shell files found' >&2
+            exit 1
+          }
+          for file in "${shell_files[@]}"; do
+            bash -n "$file"
+          done
+          shellcheck --severity=error --external-sources "${shell_files[@]}"
+
+      - name: Validate package profiles and repository identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          for profile in common dev sd-release nand-installer nand-recovery; do
+            manifest="packages/${profile}.txt"
+            [[ -s "$manifest" ]] || {
+              echo "Missing package manifest: $manifest" >&2
+              exit 1
+            }
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              line="${line%%#*}"
+              line="${line//[[:space:]]/}"
+              [[ -z "$line" || "$line" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?$ ]] || {
+                echo "Invalid package name in $manifest: $line" >&2
+                exit 1
+              }
+            done < "$manifest"
+          done
+
+          bash scripts/check-pcduino3b-identity.sh
+          bash tests/test-pcduino3b-selftest.sh
+          bash tests/test-pcduino3b-profile-suffix.sh
+          while IFS= read -r test_file; do
+            [[ "$test_file" == tests/test-pcduino3b-selftest.sh ]] && continue
+            bash "$test_file"
+          done < <(find tests -maxdepth 1 -type f -name '*nand*.sh' -print 2>/dev/null | sort)
+
+      - name: Checkout pinned Armbian framework
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: armbian/build
+          ref: ${{ env.ARMBIAN_BUILD_REF }}
+          fetch-depth: 1
+          path: armbian-framework
+
+      - name: Parse the custom board with the pinned framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p armbian-framework/userpatches
+          rsync -a userpatches/ armbian-framework/userpatches/
+
+          for branch_series in legacy:6.12 current:6.18 edge:7.1; do
+            branch=${branch_series%%:*}
+            series=${branch_series#*:}
+            config_json="$RUNNER_TEMP/pcduino3b-board-${branch}.json"
+            CONFIG_DEFS_ONLY=yes armbian-framework/compile.sh config-dump-json \
+              BOARD=pcduino3b \
+              BRANCH="$branch" \
+              RELEASE=noble \
+              BUILD_DESKTOP=no \
+              BUILD_MINIMAL=yes \
+              ENABLE_EXTENSIONS=pcduino3b-gigabit \
+              > "$config_json"
+
+            jq -e --arg branch "$branch" --arg series "$series" '
+              .BOARD == "pcduino3b" and
+              .BOARD_NAME == "pcDuino3B" and
+              .BOARD_VENDOR == "linksprite" and
+              .BOARDFAMILY == "sun7i" and
+              .LINUXFAMILY == "sunxi" and
+              .ARCH == "armhf" and
+              .BOOTCONFIG == "Linksprite_pcDuino3_defconfig" and
+              .BOOT_FDT_FILE == "allwinner/sun7i-a20-pcduino3b.dtb" and
+              .BRANCH == $branch and
+              .KERNEL_MAJOR_MINOR == $series
+            ' "$config_json"
+
+            test -s "userpatches/kernel/archive/sunxi-${series}/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
+          done
+
+      - name: Checkout Linux DTS baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: gregkh/linux
+          ref: ${{ env.LINUX_DTS_REF }}
+          fetch-depth: 1
+          path: linux-dts
+          sparse-checkout: |
+            arch/arm/boot/dts/allwinner
+            include/dt-bindings
+            include/uapi/linux
+
+      - name: Apply, compile and inspect the dedicated DTB
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/userpatches/kernel/archive/sunxi-6.18/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
+          framework_patch="$GITHUB_WORKSPACE/armbian-framework/patch/kernel/archive/sunxi-6.18/patches.armbian/arm-dts-sun7i-a20-pcduino3-add-hdmi.patch"
+          # The pcDuino3B DTS includes the compatibility DTS, so reproduce the
+          # pinned framework's earlier pcDuino3 HDMI patch before applying the
+          # repository patch.  Staging that baseline lets the following diff
+          # prove our patch itself does not alter the original pcDuino3 file.
+          git -C linux-dts apply --check "$framework_patch"
+          git -C linux-dts apply "$framework_patch"
+          git -C linux-dts add arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
+          git -C linux-dts apply --check "$patch"
+          git -C linux-dts apply "$patch"
+          git -C linux-dts diff --exit-code -- arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts
+
+          compile_dtb() {
+            local source="$1"
+            local output="$2"
+            cpp -nostdinc \
+              -I linux-dts/include \
+              -I linux-dts/arch/arm/boot/dts/allwinner \
+              -undef -D__DTS__ -x assembler-with-cpp "$source" \
+              | dtc -I dts -O dtb -o "$output"
+          }
+
+          compile_dtb \
+            linux-dts/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b.dts \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3b.dtb"
+          dtc -I dtb -O dts \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3b.dtb" \
+            > "$RUNNER_TEMP/sun7i-a20-pcduino3b.roundtrip.dts"
+          grep -Eq 'model = "LinkSprite pcDuino3B";' \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3b.roundtrip.dts"
+          grep -Eq 'phy-mode = "rgmii-id";' \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3b.roundtrip.dts"
+
+          compile_dtb \
+            linux-dts/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3.dtb"
+          dtc -I dtb -O dts "$RUNNER_TEMP/sun7i-a20-pcduino3.dtb" \
+            > "$RUNNER_TEMP/sun7i-a20-pcduino3.roundtrip.dts"
+          grep -Eq 'model = "LinkSprite pcDuino3";' \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3.roundtrip.dts"
+          grep -Eq 'phy-mode = "mii";' \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3.roundtrip.dts"
+
+      - name: Preflight summary
+        if: always()
+        shell: bash
+        run: |
+          elapsed=$(( $(date +%s) - PREFLIGHT_STARTED ))
+          {
+            echo '## pcDuino3B fast preflight'
+            echo
+            echo "- Result: **${{ job.status }}**"
+            echo "- Elapsed: $((elapsed / 60))m $((elapsed % 60))s"
+            echo "- Armbian framework: \`$ARMBIAN_BUILD_REF\`"
+            echo '- Full rootfs/image build: not run'
+          } >> "$GITHUB_STEP_SUMMARY"

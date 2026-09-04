@@ -1,0 +1,792 @@
+name: pcDuino3B image build
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Image purpose and package profile
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - sd-release
+          - nand-installer
+          - nand-recovery
+      compression:
+        description: fast uses zstd; release uses xz
+        required: true
+        type: choice
+        default: fast
+        options:
+          - fast
+          - release
+      force_kernel_rebuild:
+        description: Rebuild only the kernel artifact before assembling the image
+        required: true
+        type: boolean
+        default: false
+      publish:
+        description: Upload an accepted candidate to a GitHub prerelease
+        required: true
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    tags:
+      - 'image-build-*'
+    paths:
+      - '.github/workflows/image-build.yml'
+      - 'packages/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'userpatches/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pcduino3b-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARMBIAN_BUILD_REF: 34e66c37211c70ef5cfad9c80dd76389720e19b7
+  ARMBIAN_OS_REF: 91dbddfe6a576a3034a71eb9dd4f638f9366fc84
+  ARMBIAN_VERSION: 26.8.6
+  BOARD: pcduino3b
+  BOARDFAMILY: sun7i
+  LINUXFAMILY: sunxi
+  KERNEL_BRANCH: current
+  KERNEL_SERIES: '6.18'
+  RELEASE: noble
+
+jobs:
+  build:
+    name: Build and accept candidate image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Start build timer
+        shell: bash
+        run: |
+          now=$(date +%s)
+          echo "JOB_STARTED=$now" >> "$GITHUB_ENV"
+          echo "RUNNER_INIT_SECONDS=0" >> "$GITHUB_ENV"
+
+      - name: Checkout customizations
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve profile, packages and cache keys
+        id: config
+        shell: bash
+        env:
+          DISPATCH_PROFILE: ${{ inputs.profile }}
+          DISPATCH_COMPRESSION: ${{ inputs.compression }}
+          DISPATCH_FORCE: ${{ inputs.force_kernel_rebuild }}
+          DISPATCH_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            profile="$DISPATCH_PROFILE"
+            compression="$DISPATCH_COMPRESSION"
+            force="$DISPATCH_FORCE"
+            publish="$DISPATCH_PUBLISH"
+          elif [[ "$GITHUB_REF" == refs/tags/image-build-* ]]; then
+            case "$GITHUB_REF_NAME" in
+              image-build-nand-installer-*) profile=nand-installer ;;
+              image-build-nand-recovery-*) profile=nand-recovery ;;
+              *) profile=sd-release ;;
+            esac
+            compression=release
+            force=false
+            publish=true
+          else
+            profile=dev
+            compression=fast
+            force=false
+            publish=false
+          fi
+
+          case "$profile" in
+            dev|sd-release|nand-installer|nand-recovery) ;;
+            *) echo "Unknown profile: $profile" >&2; exit 1 ;;
+          esac
+          case "$compression" in
+            fast|release) ;;
+            *) echo "Unknown compression: $compression" >&2; exit 1 ;;
+          esac
+          [[ "$force" == true || "$force" == false ]]
+          [[ "$publish" == true || "$publish" == false ]]
+
+          # Development images are intentionally transient even if a dispatch
+          # caller accidentally selects publish=true.
+          [[ "$profile" == dev ]] && publish=false
+
+          if [[ "$profile" == sd-release ]]; then
+            build_minimal=no
+          else
+            build_minimal=yes
+          fi
+          [[ "$compression" == release ]] && runner_clean=yes || runner_clean=no
+
+          declare -a packages=()
+          for manifest in packages/common.txt "packages/${profile}.txt"; do
+            [[ -s "$manifest" ]] || { echo "Missing $manifest" >&2; exit 1; }
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              line="${line%%#*}"
+              line="${line//[[:space:]]/}"
+              [[ -z "$line" ]] && continue
+              [[ "$line" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?$ ]] || {
+                echo "Invalid package name in $manifest: $line" >&2
+                exit 1
+              }
+              packages+=("$line")
+            done < "$manifest"
+          done
+          mapfile -t packages < <(printf '%s\n' "${packages[@]}" | LC_ALL=C sort -u)
+          extra_packages="${packages[*]}"
+
+          hash_paths() {
+            local path
+            local -a existing=()
+            for path in "$@"; do
+              [[ -e "$path" ]] && existing+=("$path")
+            done
+            if ((${#existing[@]} == 0)); then
+              printf empty | sha256sum | cut -c1-16
+            else
+              find "${existing[@]}" -type f -print0 \
+                | LC_ALL=C sort -z \
+                | xargs -0 sha256sum \
+                | sha256sum \
+                | cut -c1-16
+            fi
+          }
+
+          kernel_config_hash=$(hash_paths userpatches/config/kernel userpatches/extensions/pcduino3b-gigabit.sh)
+          dts_hash=$(hash_paths userpatches/kernel)
+          uboot_hash=$(hash_paths userpatches/config/boards/pcduino3b.csc userpatches/u-boot)
+          packages_hash=$(hash_paths packages/common.txt "packages/${profile}.txt")
+          cache_base="armbian-${RUNNER_OS}-arm-${ARMBIAN_BUILD_REF}-${ARMBIAN_OS_REF}-${BOARDFAMILY}-${BOARD}-${KERNEL_BRANCH}-${KERNEL_SERIES}-${RELEASE}"
+
+          mkdir -p userpatches/overlay/etc
+          printf '%s\n' "$profile" > userpatches/overlay/etc/pcduino3b-image-profile
+
+          {
+            echo "profile=$profile"
+            echo "compression=$compression"
+            echo "force=$force"
+            echo "publish=$publish"
+            echo "build_minimal=$build_minimal"
+            echo "runner_clean=$runner_clean"
+            echo "extra_packages=$extra_packages"
+            echo "kernel_config_hash=$kernel_config_hash"
+            echo "dts_hash=$dts_hash"
+            echo "uboot_hash=$uboot_hash"
+            echo "packages_hash=$packages_hash"
+            echo "cache_base=$cache_base"
+            echo "artifact_cache_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
+            echo "artifact_restore_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-"
+            echo "ccache_key=${cache_base}-ccache-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
+            echo "rootfs_key=${cache_base}-rootfs-${build_minimal}-${profile}-${packages_hash}"
+            echo "candidate_tag=pcduino3b-${profile}-candidate-${GITHUB_RUN_ID}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Runner capacity before optional clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          df -i
+          docker system df || true
+          du -sh /opt/hostedtoolcache /usr/local/lib/android 2>/dev/null || true
+          echo "CLEAN_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Free disk for release compression
+        if: steps.config.outputs.runner_clean == 'yes'
+        uses: descriptinc/free-disk-space@1b4b157593c6801212a2ed488c205e0a810b4592 # pinned main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Runner capacity after optional clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.config.outputs.runner_clean }}" == yes ]]; then
+            clean_seconds=$(( $(date +%s) - CLEAN_STARTED ))
+          else
+            clean_seconds=0
+          fi
+          echo "RUNNER_CLEAN_SECONDS=$clean_seconds" >> "$GITHUB_ENV"
+          df -h
+          df -i
+          docker system df || true
+
+      - name: Mark framework checkout start
+        shell: bash
+        run: echo "FRAMEWORK_CHECKOUT_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout pinned Armbian OS defaults
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: armbian/os
+          ref: ${{ env.ARMBIAN_OS_REF }}
+          fetch-depth: 1
+          path: armbian-os
+
+      - name: Checkout pinned Armbian framework
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: armbian/build
+          ref: ${{ env.ARMBIAN_BUILD_REF }}
+          fetch-depth: 1
+          path: build
+
+      - name: Record framework checkout time
+        shell: bash
+        run: echo "FRAMEWORK_CHECKOUT_SECONDS=$(( $(date +%s) - FRAMEWORK_CHECKOUT_STARTED ))" >> "$GITHUB_ENV"
+
+      - name: Restore compiled artifact cache
+        id: artifact-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            build/output/packages-hashed
+            build/output/debs
+          key: ${{ steps.config.outputs.artifact_cache_key }}
+          restore-keys: |
+            ${{ steps.config.outputs.artifact_restore_key }}
+            ${{ steps.config.outputs.cache_base }}-artifacts-
+
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/cache/ccache
+          key: ${{ steps.config.outputs.ccache_key }}
+          restore-keys: |
+            ${{ steps.config.outputs.cache_base }}-ccache-
+
+      - name: Restore rootfs cache
+        id: rootfs-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/cache/rootfs
+          key: ${{ steps.config.outputs.rootfs_key }}
+          restore-keys: |
+            ${{ steps.config.outputs.cache_base }}-rootfs-${{ steps.config.outputs.build_minimal }}-
+
+      - name: Report restored cache sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          size_bytes() {
+            local path size total=0
+            for path in "$@"; do
+              [[ -e "$path" ]] || continue
+              size=$(du -sb "$path" | awk '{print $1}')
+              total=$((total + size))
+            done
+            echo "$total"
+          }
+          artifact_bytes=$(size_bytes build/output/packages-hashed build/output/debs)
+          ccache_bytes=$(size_bytes build/cache/ccache)
+          rootfs_bytes=$(size_bytes build/cache/rootfs)
+          {
+            echo "ARTIFACT_CACHE_RESTORED_BYTES=$artifact_bytes"
+            echo "CCACHE_RESTORED_BYTES=$ccache_bytes"
+            echo "ROOTFS_CACHE_RESTORED_BYTES=$rootfs_bytes"
+          } >> "$GITHUB_ENV"
+          du -sh \
+            build/output/packages-hashed \
+            build/output/debs \
+            build/cache/ccache \
+            build/cache/rootfs \
+            2>/dev/null || true
+
+      - name: Stage customizations
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/userpatches
+          rsync -a armbian-os/userpatches/ build/userpatches/
+          rsync -a userpatches/ build/userpatches/
+
+      - name: Prepare Armbian build host
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          sudo build/compile.sh requirements
+          sudo chown -R "$USER:$USER" build
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build raw image
+        id: armbian
+        shell: bash
+        env:
+          PCDUINO3B_IMAGE_PROFILE: ${{ steps.config.outputs.profile }}
+          EXTRA_PACKAGES_IMAGE: ${{ steps.config.outputs.extra_packages }}
+          BUILD_MINIMAL: ${{ steps.config.outputs.build_minimal }}
+          FORCE_KERNEL_REBUILD: ${{ steps.config.outputs.force }}
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          log="$RUNNER_TEMP/armbian-build.log"
+          touch "$log"
+
+          common_args=(
+            REVISION="$ARMBIAN_VERSION"
+            BOARD="$BOARD"
+            BRANCH="$KERNEL_BRANCH"
+            RELEASE="$RELEASE"
+            KERNEL_CONFIGURE=no
+            BUILD_DESKTOP=no
+            BUILD_MINIMAL="$BUILD_MINIMAL"
+            ENABLE_EXTENSIONS=pcduino3b-gigabit
+            COMPRESS_OUTPUTIMAGE=img
+            EXTRA_PACKAGES_IMAGE="$EXTRA_PACKAGES_IMAGE"
+            PCDUINO3B_IMAGE_PROFILE="$PCDUINO3B_IMAGE_PROFILE"
+            PRIVATE_CCACHE=yes
+            SHARE_LOG=yes
+            EXPERT=yes
+          )
+
+          cd build
+          if [[ "$FORCE_KERNEL_REBUILD" == true ]]; then
+            ./compile.sh kernel ARTIFACT_IGNORE_CACHE=yes "${common_args[@]}" 2>&1 | tee -a "$log"
+          fi
+          ./compile.sh build ARTIFACT_IGNORE_CACHE=no "${common_args[@]}" 2>&1 | tee -a "$log"
+          cd ..
+
+          perl -pe 's/\e\[[0-9;]*[[:alpha:]]//g' "$log" \
+            | sed -n "s/.*Section '\([^']*\)' took \([0-9][0-9]*\)s.*/\1 \2/p" \
+            > "$RUNNER_TEMP/armbian-sections.txt"
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Accept uncompressed image
+        id: acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          sudo apt-get install -y --no-install-recommends device-tree-compiler
+
+          mapfile -t images < <(find build/output/images -maxdepth 1 -type f -name '*.img' | sort)
+          ((${#images[@]} == 1)) || {
+            printf 'Expected exactly one raw image, got %d\n' "${#images[@]}" >&2
+            printf '%s\n' "${images[@]}" >&2
+            exit 1
+          }
+          raw_image="${images[0]}"
+          [[ "$(basename "$raw_image")" == *Pcduino3b* ]] || {
+            echo "Image name does not contain Pcduino3b: $(basename "$raw_image")" >&2
+            exit 1
+          }
+          image_basename=$(basename "$raw_image")
+          case '${{ steps.config.outputs.profile }}' in
+            nand-installer)
+              [[ "$image_basename" == *-nand-installer* ]] || {
+                echo "NAND installer image name lacks -nand-installer: $image_basename" >&2
+                exit 1
+              }
+              ;;
+            nand-recovery)
+              [[ "$image_basename" == *-nand-recovery* ]] || {
+                echo "NAND recovery image name lacks -nand-recovery: $image_basename" >&2
+                exit 1
+              }
+              ;;
+            dev|sd-release)
+              [[ "$image_basename" != *-nand-installer* && "$image_basename" != *-nand-recovery* ]] || {
+                echo "SD image name unexpectedly contains a NAND suffix: $image_basename" >&2
+                exit 1
+              }
+              ;;
+          esac
+
+          mount_dir=$(mktemp -d)
+          loop_device=$(sudo losetup --find --show --partscan "$raw_image")
+          cleanup() {
+            sudo umount "$mount_dir" 2>/dev/null || true
+            sudo losetup -d "$loop_device" 2>/dev/null || true
+            rmdir "$mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sudo udevadm settle
+          root_part=$(lsblk -lnpo NAME,FSTYPE "$loop_device" \
+            | awk '$2 == "ext4" || $2 == "btrfs" { print $1; exit }')
+          [[ -n "$root_part" ]] || {
+            lsblk -f "$loop_device" >&2
+            echo 'Root filesystem partition not found' >&2
+            exit 1
+          }
+          sudo mount -o ro "$root_part" "$mount_dir"
+
+          sudo grep -qx 'VERSION_CODENAME=noble' "$mount_dir/etc/os-release"
+          [[ "$(sudo tr -d '\n' < "$mount_dir/etc/hostname")" == pcduino3b ]]
+          sudo grep -Eq '^127\.0\.1\.1[[:space:]]+pcduino3b([[:space:]]|$)' "$mount_dir/etc/hosts"
+          sudo grep -qx 'BOARD=pcduino3b' "$mount_dir/etc/armbian-release"
+          sudo grep -Eq '^BOARD_NAME="?pcDuino3B"?$' "$mount_dir/etc/armbian-release"
+          sudo grep -qx 'ARMBIAN_BOARD=pcduino3b' "$mount_dir/etc/pcduino3b-build-info"
+          sudo grep -qx 'ARMBIAN_FAMILY=sunxi' "$mount_dir/etc/pcduino3b-build-info"
+          sudo grep -qx 'UBUNTU_CODENAME=noble' "$mount_dir/etc/pcduino3b-build-info"
+          sudo grep -qx 'IMAGE_PROFILE=${{ steps.config.outputs.profile }}' "$mount_dir/etc/pcduino3b-build-info"
+          sudo grep -Rqs --include='*.list' --include='*.sources' noble "$mount_dir/etc/apt"
+          sudo bash -n "$mount_dir/usr/local/sbin/pcduino3b-selftest"
+          nand_probe="$mount_dir/usr/local/sbin/pcduino3b-nand-probe"
+          case '${{ steps.config.outputs.profile }}' in
+            nand-installer|nand-recovery)
+              sudo test -x "$nand_probe"
+              sudo bash -n "$nand_probe"
+              ;;
+            dev|sd-release)
+              sudo test ! -e "$nand_probe"
+              ;;
+          esac
+
+          kernel_config=$(find "$mount_dir/boot" -maxdepth 1 -type f -name 'config-*' | sort | tail -n1)
+          [[ -n "$kernel_config" ]] || { echo 'Kernel config not found' >&2; exit 1; }
+          for option in \
+            CONFIG_STMMAC_ETH=y \
+            CONFIG_STMMAC_PLATFORM=y \
+            CONFIG_DWMAC_SUNXI=y \
+            CONFIG_REALTEK_PHY=y; do
+            sudo grep -qx "$option" "$kernel_config"
+          done
+
+          dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb | head -n1)
+          original_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3.dtb | head -n1)
+          [[ -n "$dtb" && -n "$original_dtb" ]] || {
+            echo 'Dedicated or compatibility DTB missing' >&2
+            exit 1
+          }
+          sudo dtc -I dtb -O dts "$dtb" > "$RUNNER_TEMP/pcduino3b-image.dts" 2>/dev/null
+          sudo dtc -I dtb -O dts "$original_dtb" > "$RUNNER_TEMP/pcduino3-image.dts" 2>/dev/null
+          grep -Eq 'model = "LinkSprite pcDuino3B";' "$RUNNER_TEMP/pcduino3b-image.dts"
+          grep -Eq 'phy-mode = "rgmii-id";' "$RUNNER_TEMP/pcduino3b-image.dts"
+          grep -Eq 'model = "LinkSprite pcDuino3";' "$RUNNER_TEMP/pcduino3-image.dts"
+          grep -Eq 'phy-mode = "mii";' "$RUNNER_TEMP/pcduino3-image.dts"
+          sudo grep -Eq '^fdtfile=(allwinner/)?sun7i-a20-pcduino3b\.dtb$' "$mount_dir/boot/armbianEnv.txt"
+
+          raw_bytes=$(stat -c %s "$raw_image")
+          raw_sha256=$(sha256sum "$raw_image" | awk '{print $1}')
+          echo "raw_image=$raw_image" >> "$GITHUB_OUTPUT"
+          echo "raw_bytes=$raw_bytes" >> "$GITHUB_OUTPUT"
+          echo "raw_sha256=$raw_sha256" >> "$GITHUB_OUTPUT"
+          echo "root_part=$root_part" >> "$GITHUB_OUTPUT"
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Compress accepted image and test stream
+        id: compression
+        shell: bash
+        env:
+          RAW_IMAGE: ${{ steps.acceptance.outputs.raw_image }}
+          MODE: ${{ steps.config.outputs.compression }}
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          case "$MODE" in
+            fast)
+              zstd -T0 -9 --rm "$RAW_IMAGE"
+              compressed_image="${RAW_IMAGE}.zst"
+              ;;
+            release)
+              xz -T0 -6 "$RAW_IMAGE"
+              compressed_image="${RAW_IMAGE}.xz"
+              ;;
+          esac
+          compression_seconds=$(( $(date +%s) - started ))
+
+          integrity_started=$(date +%s)
+          case "$MODE" in
+            fast) zstd -t "$compressed_image" ;;
+            release) xz -t "$compressed_image" ;;
+          esac
+          integrity_seconds=$(( $(date +%s) - integrity_started ))
+
+          compressed_bytes=$(stat -c %s "$compressed_image")
+          compressed_sha256=$(sha256sum "$compressed_image" | awk '{print $1}')
+          (
+            cd "$(dirname "$compressed_image")"
+            sha256sum -b "$(basename "$compressed_image")" \
+              > "$(basename "$compressed_image").sha"
+          )
+          ratio=$(awk -v raw='${{ steps.acceptance.outputs.raw_bytes }}' -v compressed="$compressed_bytes" \
+            'BEGIN { printf "%.1f", compressed * 100 / raw }')
+
+          {
+            echo "image=$compressed_image"
+            echo "sha_file=${compressed_image}.sha"
+            echo "bytes=$compressed_bytes"
+            echo "sha256=$compressed_sha256"
+            echo "ratio=$ratio"
+            echo "seconds=$compression_seconds"
+            echo "integrity_seconds=$integrity_seconds"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write candidate verification report
+        id: report
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$GITHUB_WORKSPACE/CI-VERIFICATION-${{ steps.config.outputs.profile }}-${GITHUB_RUN_ID}.txt"
+          {
+            echo 'BUILD=PASS'
+            echo 'IMAGE_ACCEPTANCE=PASS'
+            echo 'RELEASE_UPLOAD=PENDING'
+            echo 'HARDWARE_ACCEPTANCE=PENDING'
+            echo "REPOSITORY_COMMIT=$GITHUB_SHA"
+            echo "ARMBIAN_BUILD_REF=$ARMBIAN_BUILD_REF"
+            echo "ARMBIAN_OS_REF=$ARMBIAN_OS_REF"
+            echo "PROFILE=${{ steps.config.outputs.profile }}"
+            echo "IMAGE=$(basename '${{ steps.compression.outputs.image }}')"
+            echo "IMAGE_SHA256=${{ steps.compression.outputs.sha256 }}"
+            echo "RAW_SHA256=${{ steps.acceptance.outputs.raw_sha256 }}"
+            echo 'BOARD=pcduino3b'
+            echo 'BOARD_NAME=pcDuino3B'
+            echo 'DTB=sun7i-a20-pcduino3b.dtb'
+            echo 'DT_MODEL=LinkSprite pcDuino3B'
+            echo 'DT_PHY_MODE=rgmii-id'
+            echo 'USERSPACE=Ubuntu Noble armhf'
+            echo 'HARDWARE_TEST_COMMAND=sudo pcduino3b-selftest'
+          } | tee "$report"
+          echo "path=$report" >> "$GITHUB_OUTPUT"
+
+      - name: Upload accepted candidate prerelease
+        id: prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ steps.config.outputs.publish }}
+          CANDIDATE_TAG: ${{ steps.config.outputs.candidate_tag }}
+          IMAGE: ${{ steps.compression.outputs.image }}
+          SHA_FILE: ${{ steps.compression.outputs.sha_file }}
+        run: |
+          set -uo pipefail
+          if [[ "$PUBLISH" != true ]]; then
+            echo 'status=SKIPPED' >> "$GITHUB_OUTPUT"
+            echo 'seconds=0' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          started=$(date +%s)
+          notes="$RUNNER_TEMP/candidate-release-notes.md"
+          {
+            echo "pcDuino3B ${{ steps.config.outputs.profile }} candidate from workflow run $GITHUB_RUN_ID."
+            echo
+            echo 'This prerelease passed image acceptance. Hardware acceptance is still pending.'
+            echo 'Promote this exact byte stream with the release-promotion workflow after testing its SHA-256 on a physical pcDuino3B.'
+          } > "$notes"
+
+          status=PASS
+          if ! gh release view "$CANDIDATE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$CANDIDATE_TAG" \
+              -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "pcDuino3B ${{ steps.config.outputs.profile }} candidate $GITHUB_RUN_ID" \
+              --notes-file "$notes" \
+              --prerelease \
+              || status=FAIL
+          fi
+          if [[ "$status" == PASS ]]; then
+            gh release upload "$CANDIDATE_TAG" "$IMAGE" "$SHA_FILE" \
+              -R "$GITHUB_REPOSITORY" --clobber \
+              || status=FAIL
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize candidate verification report
+        shell: bash
+        env:
+          REPORT: ${{ steps.report.outputs.path }}
+          RELEASE_UPLOAD: ${{ steps.prerelease.outputs.status }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_UPLOAD" in
+            PASS|FAIL|SKIPPED) ;;
+            *)
+              echo "Unexpected release upload status: $RELEASE_UPLOAD" >&2
+              exit 1
+              ;;
+          esac
+          sed -i "s/^RELEASE_UPLOAD=PENDING$/RELEASE_UPLOAD=$RELEASE_UPLOAD/" "$REPORT"
+          grep -qx "RELEASE_UPLOAD=$RELEASE_UPLOAD" "$REPORT"
+
+      - name: Write build performance report
+        id: performance
+        if: always() && steps.armbian.outcome == 'success'
+        shell: bash
+        env:
+          BUILD_SECONDS: ${{ steps.armbian.outputs.seconds }}
+        run: |
+          set -euo pipefail
+          section_seconds() {
+            local regex="$1"
+            awk -v regex="$regex" '$1 ~ regex { total += $2 } END { print total + 0 }' \
+              "$RUNNER_TEMP/armbian-sections.txt"
+          }
+
+          source_seconds=$(section_seconds 'prepare.*(git|source|toolchain)|fetch.*source')
+          uboot_seconds=$(section_seconds 'compile_uboot|uboot_.*build')
+          kernel_seconds=$(section_seconds 'compile_kernel|kernel_.*build|kernel_make')
+          rootfs_seconds=$(section_seconds 'create_new_rootfs|extract_rootfs|get_or_create_rootfs')
+          customize_seconds=$(section_seconds 'customize_image')
+          assembly_seconds=$(section_seconds 'create_image_from_sdcard_rootfs')
+          report="$GITHUB_WORKSPACE/BUILD-PERFORMANCE.md"
+
+          {
+            echo '# pcDuino3B build performance'
+            echo
+            echo '| Stage | Seconds |'
+            echo '|---|---:|'
+            echo "| Runner initialization probe | $RUNNER_INIT_SECONDS |"
+            echo "| Runner clean | $RUNNER_CLEAN_SECONDS |"
+            echo "| Armbian OS/framework checkout | $FRAMEWORK_CHECKOUT_SECONDS |"
+            echo "| Host prepare | ${{ steps.host.outputs.seconds }} |"
+            echo "| Source/toolchain preparation (logged sections) | $source_seconds |"
+            echo "| U-Boot compilation (logged sections) | $uboot_seconds |"
+            echo "| Kernel compilation (logged sections) | $kernel_seconds |"
+            echo "| Rootfs create/extract (logged sections) | $rootfs_seconds |"
+            echo "| customize-image (logged sections) | $customize_seconds |"
+            echo "| Image assembly (logged sections) | $assembly_seconds |"
+            echo "| Full Armbian command(s) | ${BUILD_SECONDS:-0} |"
+            echo "| Image acceptance | ${{ steps.acceptance.outputs.seconds || '0' }} |"
+            echo "| Compression | ${{ steps.compression.outputs.seconds || '0' }} |"
+            echo "| Compression stream test | ${{ steps.compression.outputs.integrity_seconds || '0' }} |"
+            echo "| Candidate image/checksum upload | ${{ steps.prerelease.outputs.seconds || '0' }} |"
+            echo "| Total job so far | $(( $(date +%s) - JOB_STARTED )) |"
+            echo
+            echo '| Cache | Exact hit | Restored bytes |'
+            echo '|---|---|---:|'
+            echo "| Compiled artifacts | ${{ steps.artifact-cache.outputs.cache-hit || 'false' }} | $ARTIFACT_CACHE_RESTORED_BYTES |"
+            echo "| ccache | ${{ steps.ccache.outputs.cache-hit || 'false' }} | $CCACHE_RESTORED_BYTES |"
+            echo "| Rootfs | ${{ steps.rootfs-cache.outputs.cache-hit || 'false' }} | $ROOTFS_CACHE_RESTORED_BYTES |"
+            echo
+            echo "Raw image bytes: ${{ steps.acceptance.outputs.raw_bytes || 'unknown' }}"
+            echo
+            echo "Compressed image bytes: ${{ steps.compression.outputs.bytes || 'unknown' }}"
+            echo
+            echo "Compressed/raw ratio: ${{ steps.compression.outputs.ratio || 'unknown' }}%"
+          } | tee "$report"
+          echo "path=$report" >> "$GITHUB_OUTPUT"
+
+      - name: Attach final evidence to candidate
+        id: release_evidence
+        if: steps.config.outputs.publish == 'true' && steps.prerelease.outputs.status == 'PASS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.report.outputs.path }}
+          PERFORMANCE: ${{ steps.performance.outputs.path }}
+        run: |
+          set -uo pipefail
+          started=$(date +%s)
+          status=PASS
+          gh release upload "${{ steps.config.outputs.candidate_tag }}" \
+            "$REPORT" "$PERFORMANCE" \
+            -R "$GITHUB_REPOSITORY" --clobber \
+            || status=FAIL
+          if [[ "$status" == FAIL ]]; then
+            sed -i 's/^RELEASE_UPLOAD=PASS$/RELEASE_UPLOAD=FAIL/' "$REPORT"
+            gh release upload "${{ steps.config.outputs.candidate_tag }}" "$REPORT" \
+              -R "$GITHUB_REPOSITORY" --clobber >/dev/null 2>&1 || true
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Upload accepted workflow artifact
+        id: workflow-artifact
+        if: steps.compression.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pcduino3b-${{ steps.config.outputs.profile }}-${{ github.run_id }}
+          path: |
+            ${{ steps.compression.outputs.image }}
+            ${{ steps.compression.outputs.sha_file }}
+            ${{ steps.report.outputs.path }}
+            ${{ steps.performance.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Save compiled artifact cache
+        if: steps.acceptance.outcome == 'success' && steps.compression.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            build/output/packages-hashed
+            build/output/debs
+          key: ${{ steps.config.outputs.artifact_cache_key }}
+
+      - name: Save compiler cache
+        if: steps.acceptance.outcome == 'success' && steps.compression.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/cache/ccache
+          key: ${{ steps.config.outputs.ccache_key }}
+
+      - name: Save rootfs cache
+        if: steps.acceptance.outcome == 'success' && steps.compression.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/cache/rootfs
+          key: ${{ steps.config.outputs.rootfs_key }}
+
+      - name: Final runner capacity
+        if: always()
+        shell: bash
+        run: |
+          df -h
+          df -i
+          docker system df || true
+          du -sh build/cache/ccache build/cache/rootfs build/output/packages-hashed build/output/debs 2>/dev/null || true
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          outcome_label() {
+            case "$1" in
+              success) echo PASS ;;
+              failure) echo FAIL ;;
+              cancelled) echo CANCELLED ;;
+              *) echo SKIPPED ;;
+            esac
+          }
+          {
+            echo '## pcDuino3B image build'
+            echo
+            echo '| Gate | Status |'
+            echo '|---|---|'
+            echo "| BUILD | $(outcome_label '${{ steps.armbian.outcome }}') |"
+            echo "| IMAGE_ACCEPTANCE | $(outcome_label '${{ steps.acceptance.outcome }}') |"
+            echo "| RELEASE_UPLOAD | ${{ steps.release_evidence.outputs.status || steps.prerelease.outputs.status || 'SKIPPED' }} |"
+            echo '| HARDWARE_ACCEPTANCE | PENDING |'
+            echo
+            echo "- Profile: \`${{ steps.config.outputs.profile || 'unresolved' }}\`"
+            echo "- Compression: \`${{ steps.config.outputs.compression || 'unresolved' }}\`"
+            echo "- Force kernel rebuild: \`${{ steps.config.outputs.force || 'false' }}\`"
+            echo "- Runner clean: \`${{ steps.config.outputs.runner_clean || 'unresolved' }}\` (${RUNNER_CLEAN_SECONDS:-0}s)"
+            echo "- Artifact cache exact hit: \`${{ steps.artifact-cache.outputs.cache-hit || 'false' }}\`"
+            echo "- ccache exact hit: \`${{ steps.ccache.outputs.cache-hit || 'false' }}\`"
+            echo "- rootfs cache exact hit: \`${{ steps.rootfs-cache.outputs.cache-hit || 'false' }}\`"
+            echo "- Raw bytes: \`${{ steps.acceptance.outputs.raw_bytes || 'unavailable' }}\`"
+            echo "- Compressed bytes: \`${{ steps.compression.outputs.bytes || 'unavailable' }}\`"
+            echo "- Compression ratio: \`${{ steps.compression.outputs.ratio || 'unavailable' }}%\`"
+            echo "- Candidate SHA-256: \`${{ steps.compression.outputs.sha256 || 'unavailable' }}\`"
+            echo "- Candidate tag: \`${{ steps.config.outputs.candidate_tag || 'not-published' }}\`"
+            echo
+            echo 'Promotion is a separate workflow and never rebuilds or recompresses the candidate.'
+            if [[ -f BUILD-PERFORMANCE.md ]]; then
+              echo
+              cat BUILD-PERFORMANCE.md
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
