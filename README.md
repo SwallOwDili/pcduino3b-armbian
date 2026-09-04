@@ -45,12 +45,14 @@ pcDuino3B 专用设备树以其上游 A20 板级定义为兼容基础，只表�
 | --- | --- | --- |
 | `dev` | 快速网络、身份和板级验证 | Minimal；快速产物；不创建正式 Release |
 | `sd-release` | 日常 microSD 系统 | 完整验收；xz；SHA-256 |
-| `nand-installer` | 4GiB NAND 安装研究入口 | Minimal；当前仅接口和只读诊断，不具备写入授权 |
-| `nand-recovery` | NAND 备份、恢复研究入口 | Minimal；当前仅接口和只读诊断，不具备写入授权 |
+| `nand-installer` | 4GiB NAND 安装研究入口 | Minimal；选择隔离 recovery DTB，当前仍只有只读诊断 |
+| `nand-recovery` | NAND 备份、恢复研究入口 | Minimal；选择隔离 recovery DTB，不具备写入授权 |
 
 NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`pcduino3b-nand-rootfs` 和 `pcduino3b-nand-layout`。NAND 实验不进入普通 `sd-release` 镜像路径。
 
-2026-09-04 对实体板上的旧测试镜像做了只读探测：live DT 已将 NFC/NAND 节点设为 `okay`，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出；因此 `/proc/mtd` 仍为空，仅存在 `/dev/ubi_ctrl`。这套实验性 DT 启用尚未进入本仓库的普通 `sd-release`。NAND profile 中的 `sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`，仓库不提供可写安装器。
+2026-09-04 正式 SD 镜像已在实体板通过 23 项自检：从 `/dev/mmcblk0p1` 启动，独立 DTB、身份、RTL8211E 千兆、DNS/APT、USB、I2C、SATA、SSH 和 NTP 均通过。普通 `sun7i-a20-pcduino3b.dtb` 继续把 NFC 设为 `disabled`。
+
+旧测试镜像的只读证据表明：NFC/NAND 节点设为 `okay` 后，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出。隔离的 `sun7i-a20-pcduino3b-nand-recovery.dtb` 只为 NAND profile 启用 CS0/RB0 和硬件 ECC；它不声明分区，也不启用可能创建持久化表的 `nand-on-flash-bbt`。`sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`。
 
 ## 板端验收
 
