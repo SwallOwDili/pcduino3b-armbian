@@ -213,8 +213,14 @@ jobs:
           [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
           [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
           [[ "$(fdtget -t s "$recovery_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
-          ! fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt
-          ! fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions
+          if fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
+            echo 'Recovery DTB must not enable persistent on-flash BBT' >&2
+            exit 1
+          fi
+          if fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions; then
+            echo 'Recovery DTB must not declare a partition map' >&2
+            exit 1
+          fi
 
           base_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b.dtb"
           [[ "$(fdtget -t s "$base_dtb" "$base_nfc" status)" == disabled ]]

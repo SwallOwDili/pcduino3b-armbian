@@ -501,8 +501,14 @@ jobs:
           [[ "$(sudo fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
           [[ "$(sudo fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
           [[ "$(sudo fdtget -t s "$recovery_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
-          ! sudo fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt
-          ! sudo fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions
+          if sudo fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
+            echo 'Recovery DTB must not enable persistent on-flash BBT' >&2
+            exit 1
+          fi
+          if sudo fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions; then
+            echo 'Recovery DTB must not declare a partition map' >&2
+            exit 1
+          fi
 
           expected_fdt='${{ steps.config.outputs.boot_fdt_file }}'
           sudo grep -Fxq "fdtfile=$expected_fdt" "$mount_dir/boot/armbianEnv.txt"
