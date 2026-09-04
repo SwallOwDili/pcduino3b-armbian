@@ -117,6 +117,10 @@ jobs:
               ENABLE_EXTENSIONS=pcduino3b-gigabit \
               > "$config_json"
 
+            jq '{
+              BOARD, BOARD_NAME, BOARD_VENDOR, BOARDFAMILY, LINUXFAMILY,
+              ARCH, BOOTCONFIG, BOOT_FDT_FILE, BRANCH, KERNEL_MAJOR_MINOR
+            }' "$config_json"
             jq -e --arg branch "$branch" --arg series "$series" '
               .BOARD == "pcduino3b" and
               .BOARD_NAME == "pcDuino3B" and
