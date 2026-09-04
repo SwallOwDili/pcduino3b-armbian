@@ -72,6 +72,12 @@ APT
 	if [[ "$IMAGE_PROFILE" == nand-* ]]; then
 		install -D -m 0755 /tmp/overlay/usr/local/sbin/pcduino3b-nand-probe \
 			/usr/local/sbin/pcduino3b-nand-probe
+		# Recovery must reach SSH before the experimental NAND driver is
+		# explicitly loaded under observation.  The blacklist affects modalias
+		# autoloading; an operator can still run `modprobe sunxi_nand` manually.
+		install -d -m 0755 /etc/modprobe.d
+		printf '%s\n' 'blacklist sunxi_nand' \
+			>/etc/modprobe.d/pcduino3b-nand-recovery.conf
 	fi
 	normalize_identity
 

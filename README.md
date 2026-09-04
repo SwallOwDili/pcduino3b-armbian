@@ -54,7 +54,9 @@ NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`p
 
 旧测试镜像的只读证据表明：NFC/NAND 节点设为 `okay` 后，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出。隔离的 `sun7i-a20-pcduino3b-nand-recovery.dtb` 只为 NAND profile 启用 CS0/RB0 和硬件 ECC；它不声明分区，也不启用可能创建持久化表的 `nand-on-flash-bbt`。`sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`。
 
-需要快速生成探测卡时，`pcDuino3B fast NAND recovery repack` 工作流直接复用已经实机验收的正式 SD 镜像，只注入经过预检的 recovery DTB 和只读探针。它不调用 Armbian 内核构建、不替换内核，也不改变普通 SD Release；输出仍作为独立的 NAND recovery 候选发布。
+需要快速生成探测卡时，`pcDuino3B fast NAND recovery repack` 工作流直接复用已经实机验收的正式 SD 镜像，保留原始普通 DTB，并让 U-Boot 在内存中应用经过预检的 NAND recovery overlay。2026-09-04 实机验证表明，主机构建工具预合成的 recovery DTB 无法正常启动，而“普通 DTB + U-Boot overlay”可正常进入 SSH。恢复镜像会禁止 `sunxi_nand` 在启动期间被 udev 自动加载；登录后再显式执行 `sudo modprobe sunxi_nand`。它不调用 Armbian 内核构建、不替换内核，也不改变普通 SD Release；输出仍作为独立的 NAND recovery 候选发布。
+
+同日实机复测确认 runtime overlay 已进入 live DT，网卡保持 `LOWER_UP`。显式加载 `sunxi_nand` 不会使系统掉线，但探测仍因 ONFI 参数页恢复失败返回 `-22`，`/proc/mtd` 继续为空；因此当前进展是“安全复现并定位初始化失败”，不是 NAND 可安装状态。
 
 ## 板端验收
 
