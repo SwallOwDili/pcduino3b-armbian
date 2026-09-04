@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Read-only evidence collector for the pcDuino3B onboard NAND.
+
+set -uo pipefail
+
+PROC_ROOT="${PCDUINO3B_PROC_ROOT:-/proc}"
+PROC_DT_ROOT="${PCDUINO3B_PROC_DT_ROOT:-$PROC_ROOT/device-tree}"
+DEV_ROOT="${PCDUINO3B_DEV_ROOT:-/dev}"
+SYS_ROOT="${PCDUINO3B_SYS_ROOT:-/sys}"
+BOOT_ROOT="${PCDUINO3B_BOOT_ROOT:-/boot}"
+
+section() { printf '\n===== %s =====\n' "$*"; }
+
+section "Safety boundary"
+echo "MODE=READ_ONLY"
+echo "INSTALLER=NOT_AUTHORIZED"
+echo "This command only reads discovery and diagnostic interfaces."
+
+section "MTD table"
+if [[ -r "$PROC_ROOT/mtd" ]]; then
+	cat "$PROC_ROOT/mtd"
+else
+	echo "/proc/mtd is absent"
+fi
+
+section "Device nodes"
+find "$DEV_ROOT" -maxdepth 1 \( -name 'mtd*' -o -name 'ubi*' \) -print 2>/dev/null | sort
+
+section "MTD geometry exposed by sysfs"
+MTD_COUNT=0
+for mtd_path in "$SYS_ROOT"/class/mtd/mtd[0-9]*; do
+	[[ -d "$mtd_path" ]] || continue
+	MTD_COUNT=$((MTD_COUNT + 1))
+	printf '[%s]\n' "$(basename "$mtd_path")"
+	for field in name type size erasesize writesize subpagesize oobsize numeraseregions; do
+		[[ -r "$mtd_path/$field" ]] || continue
+		printf '%s=%s\n' "$field" "$(<"$mtd_path/$field")"
+	done
+done
+((MTD_COUNT > 0)) || echo "No MTD geometry is exposed in sysfs"
+
+section "Live device-tree NAND/NFC nodes"
+DT_NODE_COUNT=0
+while IFS= read -r node; do
+	DT_NODE_COUNT=$((DT_NODE_COUNT + 1))
+	status="okay"
+	[[ -r "$node/status" ]] && status="$(tr -d '\0' <"$node/status")"
+	compatible=""
+	[[ -r "$node/compatible" ]] && compatible="$(tr '\0' ',' <"$node/compatible" | sed 's/,$//')"
+	printf '%s status=%s compatible=%s\n' "$node" "${status:-unknown}" "${compatible:-unknown}"
+done < <(find -L "$PROC_DT_ROOT" -type d \( -iname '*nand*' -o -iname '*nfc*' \) 2>/dev/null | sort)
+((DT_NODE_COUNT > 0)) || echo "No NAND/NFC node was found in the live device tree"
+
+section "Kernel configuration"
+CONFIG_FILE="$BOOT_ROOT/config-$(uname -r)"
+if [[ -r "$PROC_ROOT/config.gz" ]] && command -v zcat >/dev/null 2>&1; then
+	zcat "$PROC_ROOT/config.gz" | grep -E '^CONFIG_(MTD|MTD_RAW_NAND|MTD_NAND_SUNXI|MTD_UBI|UBIFS_FS)=' || true
+elif [[ -r "$CONFIG_FILE" ]]; then
+	grep -E '^CONFIG_(MTD|MTD_RAW_NAND|MTD_NAND_SUNXI|MTD_UBI|UBIFS_FS)=' "$CONFIG_FILE" || true
+else
+	echo "Kernel configuration is unavailable"
+fi
+
+section "Kernel messages"
+dmesg 2>/dev/null | grep -Ei 'nand|mtd|ubi|sunxi.*nfc' | tail -n 120 || true
+
+if grep -qE '^mtd[0-9]+:' "$PROC_ROOT/mtd" 2>/dev/null && ((MTD_COUNT > 0)); then
+	echo
+	echo "PROBE_STATUS=READ_ONLY_DATA_AVAILABLE"
+	echo "INSTALLER=NOT_AUTHORIZED"
+	exit 0
+fi
+
+echo
+echo "PROBE_STATUS=NOT_READY"
+echo "REASON=no raw MTD device is currently enumerated"
+exit 3
