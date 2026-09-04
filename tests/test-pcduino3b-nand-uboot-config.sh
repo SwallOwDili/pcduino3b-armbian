@@ -120,8 +120,12 @@ source "$LAYOUT"
 [[ "$PCDUINO3B_NAND_ROOTFS_LEB_BYTES" \
 	-eq $((PCDUINO3B_NAND_ROOTFS_PEB_BYTES - PCDUINO3B_NAND_ROOTFS_DATA_OFFSET)) ]]
 printf '%s\n' "${CONFIG_CALLS[@]}" \
-	| grep -Fq 'nand read 0x50000000 0x02000000 0x04000000 && bootm 0x50000000'
+	| grep -Fq 'if nand read 0x50000000 0x02000000 0x04000000; then bootm 0x50000000; fi'
 printf '%s\n' "${CONFIG_CALLS[@]}" \
 	| grep -Fq "CONFIG_BOOTCOMMAND 'run distro_bootcmd;"
+if printf '%s\n' "${CONFIG_CALLS[@]}" | grep -Fq '&&'; then
+	echo 'CONFIG_BOOTCOMMAND contains an ampersand that scripts/config would expand' >&2
+	exit 1
+fi
 
 echo 'pcduino3b NAND U-Boot config fixture: PASS'
