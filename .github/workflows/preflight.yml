@@ -118,11 +118,10 @@ jobs:
               > "$config_json"
 
             jq '{
-              BOARD, BOARD_NAME, BOARD_VENDOR, BOARDFAMILY, LINUXFAMILY,
-              ARCH, BOOTCONFIG, BOOT_FDT_FILE, BRANCH, KERNEL_MAJOR_MINOR
+              BOARD_NAME, BOARD_VENDOR, BOARDFAMILY, LINUXFAMILY,
+              ARCH, BOOTCONFIG, BOOT_FDT_FILE, KERNEL_MAJOR_MINOR
             }' "$config_json"
-            jq -e --arg branch "$branch" --arg series "$series" '
-              .BOARD == "pcduino3b" and
+            jq -e --arg series "$series" '
               .BOARD_NAME == "pcDuino3B" and
               .BOARD_VENDOR == "linksprite" and
               .BOARDFAMILY == "sun7i" and
@@ -130,7 +129,6 @@ jobs:
               .ARCH == "armhf" and
               .BOOTCONFIG == "Linksprite_pcDuino3_defconfig" and
               .BOOT_FDT_FILE == "allwinner/sun7i-a20-pcduino3b.dtb" and
-              .BRANCH == $branch and
               .KERNEL_MAJOR_MINOR == $series
             ' "$config_json"
 
