@@ -6,6 +6,19 @@
 
 这不是全冷构建：U-Boot 与 Noble armhf rootfs 命中 Armbian OCI 远端缓存，内核仍完整重建。
 
+## 2026-09-04 加速对照
+
+同一套固定 Armbian 源码和 pcDuino3B 配置的后续实测已经把“冷编译”和“命中缓存”分开：
+
+| 场景 | 实测 | 关键结果 |
+| --- | ---: | --- |
+| GitHub 冷 `dev`，[run 33836056196](https://github.com/SwallOwDili/pcduino3b-armbian/actions/runs/33836056196) | 88m21s | kernel 4431s；首次没有可复用的本项目缓存 |
+| GitHub 热 `dev`，[run 33841755158](https://github.com/SwallOwDili/pcduino3b-armbian/actions/runs/33841755158) | 7m56s | kernel/U-Boot 均为 0s；Armbian 主路径 327s |
+| GitHub 正式 `sd-release`，[run 33843467845](https://github.com/SwallOwDili/pcduino3b-armbian/actions/runs/33843467845) | 15m49s | kernel/U-Boot 均为 0s；xz 压缩 150s、完整性检查 29s |
+| 本机 Docker，6 CPU（Armbian `-j9`） | kernel 4824s | 冷内核比 GitHub 冷构建慢约 9%；最终因 Docker Desktop 未建立 `/dev/loop0p1` 停在镜像组装，不是编译失败 |
+
+结论：真正的数量级加速来自复用已完成的内核、U-Boot 和 rootfs，而不是把所有宿主机 CPU 交给容器。DTS 或内核配置变化会正确使内核缓存失效；仅改用户态、文档或发布状态时，热构建可从约 88 分钟降到 8～16 分钟。正式镜像的 xz 相比开发镜像的 zstd 额外消耗约 2.5 分钟，但换来更小的发布文件。
+
 | 阶段 | 实测耗时 | 结论 |
 | --- | ---: | --- |
 | Armbian Action 总计 | 3,879,371 ms（约 64m39s） | 完整构建主路径 |

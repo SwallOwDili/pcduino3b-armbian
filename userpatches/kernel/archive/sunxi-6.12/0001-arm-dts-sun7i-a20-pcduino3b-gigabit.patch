@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pcDuino3B Armbian CI <noreply@github.com>
 Date: Fri, 4 Sep 2026 03:00:00 +0800
-Subject: [PATCH] ARM: dts: sun7i: add LinkSprite pcDuino3B
+Subject: [PATCH] ARM: dts: sun7i: add LinkSprite pcDuino3B profiles
 
 Add a separate device tree for pcDuino3B instead of changing the
 pcDuino3 description.  The boards share their A20 base design, while the
@@ -12,22 +12,73 @@ Full Duplex with an RTL8211E PHY at MDIO address 1.
 Keep the registered linksprite,pcduino3 compatible followed by the A20
 SoC fallback.  There is no pcDuino3B-specific compatible in the current
 sunxi board binding, and inventing one would fail DT schema validation.
+
+Add a separate NAND recovery DTB which enables only the controller,
+chip-select 0 and ready/busy 0 used by the onboard NAND.  Do not add a
+partition map or nand-on-flash-bbt: geometry, ECC and existing bad-block
+metadata must be observed before any persistent layout is chosen.
 ---
- arch/arm/boot/dts/allwinner/Makefile                 |  1 +
- arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b.dts | 15 +++++++++++++++
- 2 files changed, 16 insertions(+)
+ arch/arm/boot/dts/allwinner/Makefile                 |  2 ++
+ .../sun7i-a20-pcduino3b-nand-recovery.dts            | 38 ++++++++++++++++++++
+ arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b.dts | 15 ++++++++
+ 3 files changed, 55 insertions(+)
+ create mode 100644 arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b-nand-recovery.dts
  create mode 100644 arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b.dts
 
 diff --git a/arch/arm/boot/dts/allwinner/Makefile b/arch/arm/boot/dts/allwinner/Makefile
 --- a/arch/arm/boot/dts/allwinner/Makefile
 +++ b/arch/arm/boot/dts/allwinner/Makefile
-@@ -182,3 +182,4 @@ dtb-$(CONFIG_MACH_SUN7I) += \
+@@ -182,3 +182,5 @@ dtb-$(CONFIG_MACH_SUN7I) += \
 -	sun7i-a20-wits-pro-a20-dkt.dtb
 -
 +	sun7i-a20-wits-pro-a20-dkt.dtb
 +dtb-$(CONFIG_MACH_SUN7I) += sun7i-a20-pcduino3b.dtb
++dtb-$(CONFIG_MACH_SUN7I) += sun7i-a20-pcduino3b-nand-recovery.dtb
 +
  # Enables support for device-tree overlays for all pis
+diff --git a/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b-nand-recovery.dts b/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b-nand-recovery.dts
+new file mode 100644
+--- /dev/null
++++ b/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b-nand-recovery.dts
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
++/*
++ * Read-only discovery profile for the pcDuino3B onboard NAND.
++ * No partitions or persistent bad-block table are declared here.
++ */
++
++#include "sun7i-a20-pcduino3b.dts"
++
++&pio {
++	pcduino3b_nand_pins: nand-pins {
++		pins = "PC0", "PC1", "PC2", "PC5", "PC8", "PC9", "PC10",
++		       "PC11", "PC12", "PC13", "PC14", "PC15", "PC16";
++		function = "nand0";
++	};
++
++	pcduino3b_nand_cs0_pin: nand-cs0-pin {
++		pins = "PC4";
++		function = "nand0";
++	};
++
++	pcduino3b_nand_rb0_pin: nand-rb0-pin {
++		pins = "PC6";
++		function = "nand0";
++	};
++};
++
++&nfc {
++	pinctrl-names = "default";
++	pinctrl-0 = <&pcduino3b_nand_pins>, <&pcduino3b_nand_cs0_pin>,
++		    <&pcduino3b_nand_rb0_pin>;
++	status = "okay";
++
++	nand@0 {
++		reg = <0>;
++		allwinner,rb = <0>;
++		nand-ecc-mode = "hw";
++	};
++};
 diff --git a/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b.dts b/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b.dts
 new file mode 100644
 --- /dev/null

@@ -132,6 +132,22 @@ jobs:
               .KERNEL_MAJOR_MINOR == $series
             ' "$config_json"
 
+            recovery_config_json="$RUNNER_TEMP/pcduino3b-board-${branch}-nand-recovery.json"
+            CI=false ANSI_COLOR=none WRITE_EXTENSIONS_METADATA=no \
+              CONFIG_DEFS_ONLY=yes armbian-framework/compile.sh config-dump-json \
+              BOARD=pcduino3b \
+              BRANCH="$branch" \
+              RELEASE=noble \
+              BUILD_DESKTOP=no \
+              BUILD_MINIMAL=yes \
+              ENABLE_EXTENSIONS=pcduino3b-gigabit \
+              PCDUINO3B_IMAGE_PROFILE=nand-recovery \
+              > "$recovery_config_json"
+            jq -e '
+              .BOARD_NAME == "pcDuino3B" and
+              .BOOT_FDT_FILE == "allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb"
+            ' "$recovery_config_json"
+
             test -s "userpatches/kernel/archive/sunxi-${series}/0001-arm-dts-sun7i-a20-pcduino3b-gigabit.patch"
           done
 
@@ -184,6 +200,30 @@ jobs:
             "$RUNNER_TEMP/sun7i-a20-pcduino3b.roundtrip.dts"
           grep -Eq 'phy-mode = "rgmii-id";' \
             "$RUNNER_TEMP/sun7i-a20-pcduino3b.roundtrip.dts"
+
+          compile_dtb \
+            linux-dts/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3b-nand-recovery.dts \
+            "$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-recovery.dtb"
+          recovery_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-recovery.dtb"
+          base_nfc=/soc/nand-controller@1c03000
+          recovery_nand=$base_nfc/nand@0
+          [[ "$(fdtget -t s "$recovery_dtb" / model)" == 'LinkSprite pcDuino3B' ]]
+          [[ "$(fdtget -t s "$recovery_dtb" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
+          [[ "$(fdtget -t s "$recovery_dtb" "$base_nfc" status)" == okay ]]
+          [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
+          [[ "$(fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
+          [[ "$(fdtget -t s "$recovery_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
+          if fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
+            echo 'Recovery DTB must not enable persistent on-flash BBT' >&2
+            exit 1
+          fi
+          if fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions; then
+            echo 'Recovery DTB must not declare a partition map' >&2
+            exit 1
+          fi
+
+          base_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b.dtb"
+          [[ "$(fdtget -t s "$base_dtb" "$base_nfc" status)" == disabled ]]
 
           compile_dtb \
             linux-dts/arch/arm/boot/dts/allwinner/sun7i-a20-pcduino3.dts \

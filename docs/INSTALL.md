@@ -123,7 +123,7 @@ sudo pcduino3b-selftest --iperf-server 192.168.1.2
 
 ## 8. NAND 只读研究边界
 
-`nand-installer` 与 `nand-recovery` 是隔离的 Minimal profile 接口，不是已授权的写入工具。普通 `sd-release` 不包含 NAND 实验流程。
+`nand-installer` 与 `nand-recovery` 是隔离的 Minimal profile 接口，不是已授权的写入工具。普通 `sd-release` 使用 `sun7i-a20-pcduino3b.dtb`，其中 NAND 控制器保持 `disabled`；NAND profile 改用 `sun7i-a20-pcduino3b-nand-recovery.dtb`。
 
 2026-09-04 实体板旧测试镜像的只读基线如下：
 
@@ -133,7 +133,7 @@ sudo pcduino3b-selftest --iperf-server 192.168.1.2
 - `/proc/mtd` 没有设备，系统只有 `/dev/ubi_ctrl`，所以不存在可安全读取或写入的 raw MTD；
 - raw NAND/sunxi NAND 驱动是模块，UBI/UBIFS 为 built-in。
 
-这证明当前阻塞点已从“DT 节点未启用”推进到“NAND 参数/ECC 初始化失败”，但还不能据此确定唯一根因。旧测试镜像中的实验性 NAND DT 配置尚未纳入本仓库的普通 `sd-release`，不能把这次探测视为标准镜像已具备 NAND 支持。
+这证明启用控制器后，阻塞点会从“DT 节点未启用”推进到“NAND 参数/ECC 初始化失败”，但还不能据此确定唯一根因。recovery DTB 只复现经过观测的 CS0、RB0 和硬件 ECC 配置；它不声明 NAND 分区，也不包含 `nand-on-flash-bbt`，避免在几何与旧布局未知时创建持久化 BBT。普通 SD 镜像仍不受影响。
 
 `pcduino3b-nand-probe` 只安装到隔离的 NAND profile，普通 SD 镜像不携带 NAND 工具。用 NAND recovery 候选镜像启动后采集只读证据：
 
@@ -142,6 +142,8 @@ sudo pcduino3b-nand-probe
 ```
 
 若 raw MTD 仍未枚举，脚本输出 `PROBE_STATUS=NOT_READY`、`INSTALLER=NOT_AUTHORIZED` 并以状态码 3 退出。这不是脚本故障，而是防止在芯片几何、ECC 参数、坏块、分区布局和可恢复备份均未确认前进入写入阶段的安全门。
+
+即使 `/dev/mtd*` 已枚举，第一阶段也只允许读取几何、ECC、坏块标记和制作校验备份；`INSTALLER=NOT_AUTHORIZED` 不会自动改变。实际擦除或写入必须等完整备份完成恢复演练、布局经确认并获得单独授权。
 
 NAND 研究产物统一命名为：
 

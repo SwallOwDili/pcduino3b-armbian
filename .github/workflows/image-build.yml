@@ -127,6 +127,17 @@ jobs:
           else
             build_minimal=yes
           fi
+
+          case "$profile" in
+            nand-installer|nand-recovery)
+              boot_fdt_file=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb
+              nand_controller_status=okay
+              ;;
+            dev|sd-release)
+              boot_fdt_file=allwinner/sun7i-a20-pcduino3b.dtb
+              nand_controller_status=disabled
+              ;;
+          esac
           [[ "$compression" == release ]] && runner_clean=yes || runner_clean=no
 
           declare -a packages=()
@@ -178,6 +189,8 @@ jobs:
             echo "force=$force"
             echo "publish=$publish"
             echo "build_minimal=$build_minimal"
+            echo "boot_fdt_file=$boot_fdt_file"
+            echo "nand_controller_status=$nand_controller_status"
             echo "runner_clean=$runner_clean"
             echo "extra_packages=$extra_packages"
             echo "kernel_config_hash=$kernel_config_hash"
@@ -461,21 +474,44 @@ jobs:
             sudo grep -qx "$option" "$kernel_config"
           done
 
-          dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb | head -n1)
+          base_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb | head -n1)
+          recovery_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b-nand-recovery.dtb | head -n1)
           original_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3.dtb | head -n1)
-          [[ -n "$dtb" && -n "$original_dtb" ]] || {
-            echo 'Dedicated or compatibility DTB missing' >&2
+          [[ -n "$base_dtb" && -n "$recovery_dtb" && -n "$original_dtb" ]] || {
+            echo 'Base, NAND recovery or compatibility DTB missing' >&2
             exit 1
           }
-          sudo dtc -I dtb -O dts "$dtb" 2>/dev/null \
+          sudo dtc -I dtb -O dts "$base_dtb" 2>/dev/null \
             | tee "$RUNNER_TEMP/pcduino3b-image.dts" >/dev/null
+          sudo dtc -I dtb -O dts "$recovery_dtb" 2>/dev/null \
+            | tee "$RUNNER_TEMP/pcduino3b-nand-recovery-image.dts" >/dev/null
           sudo dtc -I dtb -O dts "$original_dtb" 2>/dev/null \
             | tee "$RUNNER_TEMP/pcduino3-image.dts" >/dev/null
           grep -Eq 'model = "LinkSprite pcDuino3B";' "$RUNNER_TEMP/pcduino3b-image.dts"
           grep -Eq 'phy-mode = "rgmii-id";' "$RUNNER_TEMP/pcduino3b-image.dts"
+          grep -Eq 'model = "LinkSprite pcDuino3B";' "$RUNNER_TEMP/pcduino3b-nand-recovery-image.dts"
+          grep -Eq 'phy-mode = "rgmii-id";' "$RUNNER_TEMP/pcduino3b-nand-recovery-image.dts"
           grep -Eq 'model = "LinkSprite pcDuino3";' "$RUNNER_TEMP/pcduino3-image.dts"
           grep -Eq 'phy-mode = "mii";' "$RUNNER_TEMP/pcduino3-image.dts"
-          sudo grep -Eq '^fdtfile=(allwinner/)?sun7i-a20-pcduino3b\.dtb$' "$mount_dir/boot/armbianEnv.txt"
+
+          base_nfc=/soc/nand-controller@1c03000
+          recovery_nand=$base_nfc/nand@0
+          [[ "$(sudo fdtget -t s "$base_dtb" "$base_nfc" status)" == disabled ]]
+          [[ "$(sudo fdtget -t s "$recovery_dtb" "$base_nfc" status)" == okay ]]
+          [[ "$(sudo fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
+          [[ "$(sudo fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
+          [[ "$(sudo fdtget -t s "$recovery_dtb" "$recovery_nand" nand-ecc-mode)" == hw ]]
+          if sudo fdtget -p "$recovery_dtb" "$recovery_nand" | grep -qx nand-on-flash-bbt; then
+            echo 'Recovery DTB must not enable persistent on-flash BBT' >&2
+            exit 1
+          fi
+          if sudo fdtget -l "$recovery_dtb" "$recovery_nand" | grep -qx partitions; then
+            echo 'Recovery DTB must not declare a partition map' >&2
+            exit 1
+          fi
+
+          expected_fdt='${{ steps.config.outputs.boot_fdt_file }}'
+          sudo grep -Fxq "fdtfile=$expected_fdt" "$mount_dir/boot/armbianEnv.txt"
 
           raw_bytes=$(stat -c %s "$raw_image")
           raw_sha256=$(sha256sum "$raw_image" | awk '{print $1}')
@@ -559,9 +595,10 @@ jobs:
             echo "RAW_SHA256=${{ steps.acceptance.outputs.raw_sha256 }}"
             echo 'BOARD=pcduino3b'
             echo 'BOARD_NAME=pcDuino3B'
-            echo 'DTB=sun7i-a20-pcduino3b.dtb'
+            echo "DTB=$(basename '${{ steps.config.outputs.boot_fdt_file }}')"
             echo 'DT_MODEL=LinkSprite pcDuino3B'
             echo 'DT_PHY_MODE=rgmii-id'
+            echo 'NAND_CONTROLLER_STATUS=${{ steps.config.outputs.nand_controller_status }}'
             echo 'USERSPACE=Ubuntu Noble armhf'
             echo 'HARDWARE_TEST_COMMAND=sudo pcduino3b-selftest'
           } | tee "$report"

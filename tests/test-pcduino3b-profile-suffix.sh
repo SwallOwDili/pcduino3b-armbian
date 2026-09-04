@@ -26,6 +26,23 @@ assert_suffixes sd-release ""
 assert_suffixes nand-installer "-nand-installer"
 assert_suffixes nand-recovery "-nand-recovery"
 
+assert_dtb() {
+	local profile=$1
+	local expected=$2
+	BOOT_FDT_FILE="allwinner/sun7i-a20-pcduino3b.dtb"
+	PCDUINO3B_IMAGE_PROFILE=$profile
+	extension_prepare_config__pcduino3b_profile_dtb
+	[[ "$BOOT_FDT_FILE" == "$expected" ]] || {
+		echo "unexpected DTB for $profile: $BOOT_FDT_FILE" >&2
+		exit 1
+	}
+}
+
+assert_dtb dev "allwinner/sun7i-a20-pcduino3b.dtb"
+assert_dtb sd-release "allwinner/sun7i-a20-pcduino3b.dtb"
+assert_dtb nand-installer "allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb"
+assert_dtb nand-recovery "allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb"
+
 ADDED_PACKAGES=()
 PCDUINO3B_EXTRA_PACKAGES="curl ethtool openssh-server"
 extension_prepare_config__pcduino3b_packages
