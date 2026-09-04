@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # pcDuino3B Gigabit Ethernet kernel guarantees.
 # Keep this file function-only: Armbian sources extension files into its build shell.
 
