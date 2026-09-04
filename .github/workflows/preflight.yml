@@ -107,7 +107,8 @@ jobs:
             branch=${branch_series%%:*}
             series=${branch_series#*:}
             config_json="$RUNNER_TEMP/pcduino3b-board-${branch}.json"
-            CONFIG_DEFS_ONLY=yes armbian-framework/compile.sh config-dump-json \
+            CI=false ANSI_COLOR=none WRITE_EXTENSIONS_METADATA=no \
+              CONFIG_DEFS_ONLY=yes armbian-framework/compile.sh config-dump-json \
               BOARD=pcduino3b \
               BRANCH="$branch" \
               RELEASE=noble \
