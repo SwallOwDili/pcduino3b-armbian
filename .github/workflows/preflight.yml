@@ -169,8 +169,8 @@ jobs:
             > "$pinned_config_json"
           jq -e --arg ref "$KERNEL_GIT_REF" \
             '.KERNEL_MAJOR_MINOR == "6.18" and
-             (.WANT_ARTIFACT_KERNEL_INPUTS_ARRAY |
-              contains("KERNELBRANCH=" + $ref))' \
+             any(.WANT_ARTIFACT_KERNEL_INPUTS_ARRAY[];
+                 contains("KERNELBRANCH=" + $ref))' \
             "$pinned_config_json"
 
       - name: Checkout Linux DTS baseline
