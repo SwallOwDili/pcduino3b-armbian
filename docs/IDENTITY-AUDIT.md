@@ -42,11 +42,11 @@ rg -n -i --hidden --glob '!.git/**' \
 
 ## 整改后允许引用清单
 
-整改后同一表达式（排除本报告自身）共返回 326 行。以下按文件聚合，每个命中都落入对应行的分类；数字用于防止漏扫新文件，并不把同一行内的多个关键词重复计数。
+整改后同一表达式（排除本报告自身）共返回 333 行。以下按文件聚合，每个命中都落入对应行的分类；数字用于防止漏扫新文件，并不把同一行内的多个关键词重复计数。
 
 | 文件 | 命中行 | 分类 | 说明 |
 | --- | ---: | --- | --- |
-| `.github/workflows/image-build.yml` | 43 | 1、2、3 | 当前 board/artifact/验收身份；原板 DT 只用于无污染回归。 |
+| `.github/workflows/image-build.yml` | 45 | 1、2、3 | 当前 board/artifact/验收身份；原板 DT 只用于无污染回归。 |
 | `.github/workflows/preflight.yml` | 37 | 1、2、3、4 | 三条内核线的板型解析与 current DTB；原 DTS/defconfig 是兼容验收。 |
 | `.github/workflows/release-promotion.yml` | 6 | 1、2 | 当前候选 tag、实体板和发布身份。 |
 | `README.md` | 13 | 1、2、3、4 | 当前用户身份及明确标注的底层兼容说明。 |
@@ -55,14 +55,14 @@ rg -n -i --hidden --glob '!.git/**' \
 | `packages/common.txt` | 1 | 1 | 注释中的当前展示名称；其它清单无被审计名称。 |
 | `userpatches/config/boards/pcduino3b.csc` | 6 | 2、3、4 | 当前 board/DTB、sun7i family、共享 U-Boot defconfig。 |
 | `userpatches/customize-image.sh` | 18 | 1、2 | 构建 target、hostname、hosts、build-info 与 profile。 |
-| `userpatches/extensions/pcduino3b-gigabit.sh` | 5 | 2 | 当前板专用扩展名和隔离的 NAND 文件名后缀。 |
+| `userpatches/extensions/pcduino3b-gigabit.sh` | 8 | 2 | 当前板专用扩展名、profile 软件包和隔离的 NAND 文件名后缀。 |
 | `sunxi-6.12`、`sunxi-6.18`、`sunxi-7.1` kernel patches | 48 | 1、2、3 | 三条内核线的同源新 DTS/model/DTB；原 DTS、compatible、Nano DTB 行只是 include/说明/Makefile 上下文。 |
 | `pcduino3b-selftest` | 41 | 1、2 | 当前运行身份及其严格期望值。 |
 | `pcduino3b-nand-probe` | 9 | 1、2、3 | 当前工具名；`compatible` 仅为只读 DT 字段输出。 |
 | `scripts/check-pcduino3b-identity.sh` | 28 | 1～6 | 身份 allow/deny、三内核线一致性规则本身，不生成产品身份。 |
 | `tests/test-pcduino3b-selftest.sh` | 23 | 1、2 | 当前身份 fixture，并覆盖实机缺失 PHY name 文件的场景。 |
 | `tests/test-pcduino3b-nand-probe.sh` | 7 | 1、2 | 当前工具与隔离测试 fixture。 |
-| `tests/test-pcduino3b-profile-suffix.sh` | 5 | 1、2 | 当前 profile 与 NAND 文件名隔离 fixture。 |
+| `tests/test-pcduino3b-profile-suffix.sh` | 7 | 1、2 | 当前 profile、软件包注入与 NAND 文件名隔离 fixture。 |
 
 | 路径 | 允许名称 | 分类 | 边界 |
 | --- | --- | ---: | --- |
