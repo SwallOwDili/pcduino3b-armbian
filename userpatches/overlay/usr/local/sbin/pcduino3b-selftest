@@ -98,6 +98,19 @@ detect_ethernet_interface() {
 	return 1
 }
 
+detect_wireless_interface() {
+	local iface_path
+
+	for iface_path in "$SYS_CLASS_NET"/*; do
+		[[ -e "$iface_path" || -L "$iface_path" ]] || continue
+		if [[ -d "$iface_path/wireless" ]]; then
+			basename "$iface_path"
+			return 0
+		fi
+	done
+	return 1
+}
+
 section "Identity"
 MODEL="$(tr -d '\0' <"$PROC_DT_ROOT/model" 2>/dev/null || true)"
 echo "Device tree model: ${MODEL:-unknown}"
@@ -246,6 +259,57 @@ if grep -Eqi 'sun7i-dwmac|stmmac|st_gmac' <<<"$DMESG_NET"; then
 	pass "A20 STMMAC/DWMAC messages are present in dmesg"
 else
 	warn "no STMMAC/DWMAC messages found in the current dmesg buffer"
+fi
+
+section "Onboard Wi-Fi"
+WIFI_IFACE="$(detect_wireless_interface || true)"
+WIFI_DMESG="$(dmesg 2>/dev/null | grep -Ei 'rtl8xxxu|rtl8192cu|8188(cu|eu)|firmware.*rtl' | tail -n 100 || true)"
+if [[ -z "$WIFI_IFACE" ]]; then
+	echo "$WIFI_DMESG"
+	fail "no onboard wireless interface detected; inspect lsusb and Realtek firmware errors"
+else
+	echo "Wireless interface: $WIFI_IFACE"
+	run_info ip -details link show dev "$WIFI_IFACE"
+	run_info iw dev "$WIFI_IFACE" info
+
+	WIFI_DRIVER="$(basename "$(readlink -f "$SYS_CLASS_NET/$WIFI_IFACE/device/driver" 2>/dev/null)" 2>/dev/null || true)"
+	WIFI_UEVENT="$(cat "$SYS_CLASS_NET/$WIFI_IFACE/device/uevent" 2>/dev/null || true)"
+	WIFI_PRODUCT="$(awk -F= '$1 == "PRODUCT" { print $2; exit }' <<<"$WIFI_UEVENT")"
+	[[ -n "$WIFI_DRIVER" ]] && echo "Wi-Fi driver: $WIFI_DRIVER"
+	[[ -n "$WIFI_PRODUCT" ]] && echo "USB product: $WIFI_PRODUCT"
+
+	if [[ "$WIFI_DRIVER" == rtl8192cu || "$WIFI_DRIVER" == rtl8xxxu ]]; then
+		pass "onboard Realtek Wi-Fi is bound to $WIFI_DRIVER"
+	else
+		fail "wireless interface uses '${WIFI_DRIVER:-unknown}', expected rtl8192cu or rtl8xxxu"
+	fi
+
+	if grep -Eqi '(failed to load|Direct firmware load).*(rtl8188eu|rtl8192cu)|(rtl8188eu|rtl8192cu).*failed' <<<"$WIFI_DMESG"; then
+		echo "$WIFI_DMESG"
+		fail "Realtek Wi-Fi firmware failed to load"
+	else
+		pass "no Realtek Wi-Fi firmware load failure is present in dmesg"
+	fi
+
+	if ! command -v iw >/dev/null 2>&1; then
+		fail "iw is not installed"
+	else
+		WIFI_SCAN=""
+		if WIFI_SCAN="$(iw dev "$WIFI_IFACE" scan 2>&1)"; then
+			echo "$WIFI_SCAN" | sed -n '1,80p'
+			WIFI_BSS_COUNT="$(grep -c '^BSS ' <<<"$WIFI_SCAN" || true)"
+			pass "Wi-Fi scan completed (${WIFI_BSS_COUNT} BSS entries)"
+		else
+			echo "$WIFI_SCAN"
+			fail "Wi-Fi scan failed"
+		fi
+	fi
+fi
+
+if systemctl is-active --quiet NetworkManager; then
+	pass "NetworkManager is active for Wi-Fi configuration"
+else
+	fail "NetworkManager is not active"
 fi
 
 section "IP / DNS / Ubuntu source connectivity"

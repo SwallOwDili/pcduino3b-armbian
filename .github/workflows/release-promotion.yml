@@ -11,6 +11,10 @@ on:
         description: SHA-256 physically tested on the pcDuino3B
         required: true
         type: string
+      tested_nand_bundle_sha256:
+        description: NAND installer bundle SHA-256 physically tested; required for nand-installer
+        required: false
+        type: string
       hardware_acceptance:
         description: Physical board test result
         required: true
@@ -22,6 +26,7 @@ on:
           - fail
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -41,6 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           TESTED_SHA256: ${{ inputs.tested_sha256 }}
+          TESTED_NAND_BUNDLE_SHA256: ${{ inputs.tested_nand_bundle_sha256 }}
           HARDWARE_ACCEPTANCE: ${{ inputs.hardware_acceptance }}
         run: |
           set -euo pipefail
@@ -48,6 +54,7 @@ jobs:
             echo 'candidate_tag is not a pcDuino3B candidate tag produced by image-build' >&2
             exit 1
           }
+          candidate_profile=${BASH_REMATCH[1]}
           [[ "$TESTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
             echo 'tested_sha256 must contain exactly 64 hexadecimal characters' >&2
             exit 1
@@ -71,6 +78,16 @@ jobs:
             -R "$GITHUB_REPOSITORY" \
             --dir "$evidence_dir" \
             --pattern 'CI-VERIFICATION-*.txt'
+          if [[ "$candidate_profile" == nand-installer ]]; then
+            [[ "$TESTED_NAND_BUNDLE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+              echo 'tested_nand_bundle_sha256 is required for a NAND installer and must contain 64 hexadecimal characters' >&2
+              exit 1
+            }
+            gh release download "$CANDIDATE_TAG" \
+              -R "$GITHUB_REPOSITORY" \
+              --dir "$evidence_dir" \
+              --pattern '*.tar.zst.sha256'
+          fi
 
           mapfile -t sha_files < <(find "$evidence_dir" -maxdepth 1 -type f -name '*.sha' | sort)
           mapfile -t reports < <(find "$evidence_dir" -maxdepth 1 -type f -name 'CI-VERIFICATION-*.txt' | sort)
@@ -82,6 +99,13 @@ jobs:
           grep -qx 'IMAGE_ACCEPTANCE=PASS' "${reports[0]}"
           grep -qx 'RELEASE_UPLOAD=PASS' "${reports[0]}"
           grep -qx 'HARDWARE_ACCEPTANCE=PENDING' "${reports[0]}"
+          grep -qx "PROFILE=$candidate_profile" "${reports[0]}"
+          candidate_commit=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$CANDIDATE_TAG" --jq .sha)
+          [[ "$candidate_commit" =~ ^[0-9a-f]{40}$ ]]
+          grep -qx "REPOSITORY_COMMIT=$candidate_commit" "${reports[0]}"
+          report_name=$(basename "${reports[0]}")
+          report_sha=$(sha256sum "${reports[0]}" | awk '{print $1}')
 
           candidate_sha=$(awk 'NR == 1 { print $1 }' "${sha_files[0]}")
           [[ "${candidate_sha,,}" == "${TESTED_SHA256,,}" ]] || {
@@ -90,21 +114,170 @@ jobs:
           }
           image_name=$(awk 'NR == 1 { print $2 }' "${sha_files[0]}")
           image_name="${image_name#\*}"
+          [[ "$image_name" =~ ^Armbian-.*_Pcduino3b_.*\.img\.(xz|zst)$ ]] || {
+            echo "Checksum contains an unexpected image name: $image_name" >&2
+            exit 1
+          }
           jq -e --arg name "$image_name" '.assets | any(.name == $name)' \
             <<< "$release_json" >/dev/null || {
             echo "Checksum names missing release asset: $image_name" >&2
             exit 1
           }
+          grep -qx "IMAGE=$image_name" "${reports[0]}"
+          grep -qx "IMAGE_SHA256=$candidate_sha" "${reports[0]}"
+          gh release download "$CANDIDATE_TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --dir "$evidence_dir" \
+            --pattern "$image_name"
+          downloaded_image="$evidence_dir/$image_name"
+          [[ -f "$downloaded_image" ]]
+          downloaded_image_sha=$(sha256sum "$downloaded_image" | awk '{print $1}')
+          [[ "${downloaded_image_sha,,}" == "${candidate_sha,,}" ]] || {
+            echo "Downloaded candidate image SHA-256 mismatch: $downloaded_image_sha" >&2
+            exit 1
+          }
+
+          bundle_sha=
+          bundle_name=
+          if [[ "$candidate_profile" == nand-installer ]]; then
+            mapfile -t bundle_sha_files < <(
+              find "$evidence_dir" -maxdepth 1 -type f -name '*.tar.zst.sha256' | sort
+            )
+            ((${#bundle_sha_files[@]} == 1)) || {
+              echo 'NAND installer candidate must contain exactly one bundle checksum' >&2
+              exit 1
+            }
+            bundle_sha=$(awk 'NR == 1 { print $1 }' "${bundle_sha_files[0]}")
+            [[ "${bundle_sha,,}" == "${TESTED_NAND_BUNDLE_SHA256,,}" ]] || {
+              echo "Hardware-tested NAND bundle SHA-256 does not match candidate: $bundle_sha" >&2
+              exit 1
+            }
+            grep -qx "NAND_BUNDLE_SHA256=$bundle_sha" "${reports[0]}"
+            bundle_name=$(awk 'NR == 1 { print $2 }' "${bundle_sha_files[0]}")
+            bundle_name="${bundle_name#\*}"
+            [[ "$bundle_name" =~ ^pcduino3b-nand-installer-[0-9]+\.tar\.zst$ ]] || {
+              echo "Checksum contains an unexpected NAND bundle name: $bundle_name" >&2
+              exit 1
+            }
+            jq -e --arg name "$bundle_name" '.assets | any(.name == $name)' \
+              <<< "$release_json" >/dev/null || {
+              echo "NAND bundle checksum names missing release asset: $bundle_name" >&2
+              exit 1
+            }
+            gh release download "$CANDIDATE_TAG" \
+              -R "$GITHUB_REPOSITORY" \
+              --dir "$evidence_dir" \
+              --pattern "$bundle_name"
+            downloaded_bundle="$evidence_dir/$bundle_name"
+            [[ -f "$downloaded_bundle" ]]
+            downloaded_bundle_sha=$(sha256sum "$downloaded_bundle" | awk '{print $1}')
+            [[ "${downloaded_bundle_sha,,}" == "${bundle_sha,,}" ]] || {
+              echo "Downloaded NAND bundle SHA-256 mismatch: $downloaded_bundle_sha" >&2
+              exit 1
+            }
+          fi
 
           {
             echo "candidate_sha=$candidate_sha"
+            echo "candidate_commit=$candidate_commit"
+            echo "candidate_profile=$candidate_profile"
             echo "image_name=$image_name"
+            echo "bundle_sha=$bundle_sha"
+            echo "bundle_name=$bundle_name"
+            echo "report_name=$report_name"
+            echo "report_sha=$report_sha"
             echo "release_url=$(jq -r .url <<< "$release_json")"
           } >> "$GITHUB_OUTPUT"
 
           if [[ "$HARDWARE_ACCEPTANCE" != pass ]]; then
             echo "Release left as prerelease because hardware_acceptance=$HARDWARE_ACCEPTANCE"
           fi
+
+      - name: Attach immutable hardware acceptance
+        id: attestation
+        if: inputs.hardware_acceptance == 'pass'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          CANDIDATE_COMMIT: ${{ steps.verify.outputs.candidate_commit }}
+          CANDIDATE_PROFILE: ${{ steps.verify.outputs.candidate_profile }}
+          IMAGE_NAME: ${{ steps.verify.outputs.image_name }}
+          IMAGE_SHA256: ${{ steps.verify.outputs.candidate_sha }}
+          BUNDLE_NAME: ${{ steps.verify.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ steps.verify.outputs.bundle_sha }}
+          REPORT_NAME: ${{ steps.verify.outputs.report_name }}
+          REPORT_SHA256: ${{ steps.verify.outputs.report_sha }}
+        run: |
+          set -euo pipefail
+          acceptance_dir="$RUNNER_TEMP/hardware-acceptance"
+          mkdir -p "$acceptance_dir"
+          attestation_name="HARDWARE-ACCEPTANCE-${CANDIDATE_TAG}.txt"
+          attestation="$acceptance_dir/$attestation_name"
+          accepted_at=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --jq .created_at)
+          {
+            echo 'FORMAT_VERSION=1'
+            echo 'HARDWARE_ACCEPTANCE=PASS'
+            echo "CANDIDATE_TAG=$CANDIDATE_TAG"
+            echo "CANDIDATE_COMMIT=$CANDIDATE_COMMIT"
+            echo "PROFILE=$CANDIDATE_PROFILE"
+            echo "IMAGE=$IMAGE_NAME"
+            echo "IMAGE_SHA256=$IMAGE_SHA256"
+            if [[ -n "$BUNDLE_NAME" ]]; then
+              echo "NAND_BUNDLE=$BUNDLE_NAME"
+              echo "NAND_BUNDLE_SHA256=$BUNDLE_SHA256"
+            fi
+            echo "CI_REPORT=$REPORT_NAME"
+            echo "CI_REPORT_SHA256=$REPORT_SHA256"
+            echo "PROMOTION_RUN_ID=$GITHUB_RUN_ID"
+            echo "PROMOTED_BY=$GITHUB_ACTOR"
+            echo "ACCEPTED_AT=$accepted_at"
+          } > "$attestation"
+          (
+            cd "$acceptance_dir"
+            sha256sum -b "$attestation_name" > "$attestation_name.sha256"
+          )
+
+          release_assets=$(gh release view "$CANDIDATE_TAG" \
+            -R "$GITHUB_REPOSITORY" --json assets)
+          has_attestation=$(jq -r --arg name "$attestation_name" \
+            '.assets | any(.name == $name)' <<< "$release_assets")
+          has_checksum=$(jq -r --arg name "$attestation_name.sha256" \
+            '.assets | any(.name == $name)' <<< "$release_assets")
+          if [[ "$has_attestation" == true || "$has_checksum" == true ]]; then
+            [[ "$has_attestation" == true && "$has_checksum" == true ]] || {
+              echo 'Hardware acceptance assets are incomplete; refusing to overwrite' >&2
+              exit 1
+            }
+            existing_dir="$RUNNER_TEMP/existing-hardware-acceptance"
+            mkdir -p "$existing_dir"
+            gh release download "$CANDIDATE_TAG" \
+              -R "$GITHUB_REPOSITORY" --dir "$existing_dir" \
+              --pattern "$attestation_name" \
+              --pattern "$attestation_name.sha256"
+            cmp -s "$attestation" "$existing_dir/$attestation_name"
+            cmp -s "$attestation.sha256" \
+              "$existing_dir/$attestation_name.sha256"
+          else
+            gh release upload "$CANDIDATE_TAG" \
+              "$attestation" "$attestation.sha256" \
+              -R "$GITHUB_REPOSITORY"
+          fi
+
+          verify_dir="$RUNNER_TEMP/verify-hardware-acceptance"
+          mkdir -p "$verify_dir"
+          gh release download "$CANDIDATE_TAG" \
+            -R "$GITHUB_REPOSITORY" --dir "$verify_dir" \
+            --pattern "$attestation_name" \
+            --pattern "$attestation_name.sha256"
+          (
+            cd "$verify_dir"
+            sha256sum -c "$attestation_name.sha256"
+          )
+          cmp -s "$attestation" "$verify_dir/$attestation_name"
+          echo "name=$attestation_name" >> "$GITHUB_OUTPUT"
 
       - name: Promote the same candidate bytes
         id: promotion
@@ -149,6 +322,13 @@ jobs:
             echo "- Candidate tag: \`${{ inputs.candidate_tag }}\`"
             echo "- Tested image: \`${{ steps.verify.outputs.image_name || 'unverified' }}\`"
             echo "- Tested SHA-256: \`${{ steps.verify.outputs.candidate_sha || inputs.tested_sha256 }}\`"
+            if [[ -n '${{ steps.verify.outputs.bundle_name }}' ]]; then
+              echo "- Tested NAND bundle: \`${{ steps.verify.outputs.bundle_name }}\`"
+              echo "- Tested NAND bundle SHA-256: \`${{ steps.verify.outputs.bundle_sha }}\`"
+            fi
+            if [[ -n '${{ steps.attestation.outputs.name }}' ]]; then
+              echo "- Hardware attestation: \`${{ steps.attestation.outputs.name }}\`"
+            fi
             echo '- Rebuild: **not run**'
             echo '- Recompression: **not run**'
           } >> "$GITHUB_STEP_SUMMARY"

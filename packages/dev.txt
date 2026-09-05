@@ -2,4 +2,3 @@
 i2c-tools
 iperf3
 iproute2
-usbutils

@@ -14,15 +14,21 @@ mkdir -p \
 	"$TEST_ROOT/proc" \
 	"$TEST_ROOT/real-dt/soc/ethernet@1c50000" \
 	"$TEST_ROOT/sys/class/net/end0/phydev" \
+	"$TEST_ROOT/sys/class/net/wlan0/device" \
+	"$TEST_ROOT/sys/class/net/wlan0/wireless" \
+	"$TEST_ROOT/sys/bus/usb/drivers/rtl8xxxu" \
 	"$TEST_ROOT/sys/bus/mdio_bus/drivers/realtek"
 ln -s "$TEST_ROOT/real-dt" "$TEST_ROOT/proc/device-tree"
 ln -s "$TEST_ROOT/sys/bus/mdio_bus/drivers/realtek" "$TEST_ROOT/sys/class/net/end0/phydev/driver"
+ln -s "$TEST_ROOT/sys/bus/usb/drivers/rtl8xxxu" "$TEST_ROOT/sys/class/net/wlan0/device/driver"
 
 printf 'LinkSprite pcDuino3B\0' >"$TEST_ROOT/real-dt/model"
 printf 'rgmii-id\0' >"$TEST_ROOT/real-dt/soc/ethernet@1c50000/phy-mode"
 printf '1\n' >"$TEST_ROOT/sys/class/net/end0/type"
+printf '1\n' >"$TEST_ROOT/sys/class/net/wlan0/type"
 printf 'RTL8211E Gigabit Ethernet\n' >"$TEST_ROOT/sys/class/net/end0/phydev/name"
 printf 'DRIVER=realtek\n' >"$TEST_ROOT/sys/class/net/end0/phydev/uevent"
+printf 'DRIVER=rtl8xxxu\nPRODUCT=bda/8179/0\n' >"$TEST_ROOT/sys/class/net/wlan0/device/uevent"
 printf 'pcduino3b\n' >"$TEST_ROOT/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 pcduino3b\n' >"$TEST_ROOT/etc/hosts"
 printf 'VERSION_CODENAME=noble\n' >"$TEST_ROOT/etc/os-release"
@@ -74,7 +80,16 @@ MOCK
 cat >"$TEST_ROOT/bin/dmesg" <<'MOCK'
 #!/usr/bin/env bash
 echo 'stmmaceth 1c50000.ethernet end0: PHY [stmmac-0:01] driver [RTL8211E Gigabit Ethernet]'
+echo 'usb 2-1: rtl8xxxu loading rtlwifi/rtl8188eufw.bin'
 echo 'sunxi-ahci 1c18000.sata: controller initialized'
+MOCK
+cat >"$TEST_ROOT/bin/iw" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$*" == 'dev wlan0 scan' ]]; then
+	echo 'BSS 00:11:22:33:44:55(on wlan0)'
+	exit 0
+fi
+exit 0
 MOCK
 cat >"$TEST_ROOT/bin/systemctl" <<'MOCK'
 #!/usr/bin/env bash
@@ -107,6 +122,9 @@ grep -Fq '[PASS] GMAC device tree uses rgmii-id' "$OUTPUT"
 grep -Fq 'Ethernet interface: end0' "$OUTPUT"
 grep -Fq '[PASS] RTL8211E PHY is bound' "$OUTPUT"
 grep -Fq '[PASS] Ethernet negotiated 1000Mb/s Full Duplex' "$OUTPUT"
+grep -Fq '[PASS] onboard Realtek Wi-Fi is bound to rtl8xxxu' "$OUTPUT"
+grep -Fq '[PASS] Wi-Fi scan completed (1 BSS entries)' "$OUTPUT"
+grep -Fq '[PASS] NetworkManager is active for Wi-Fi configuration' "$OUTPUT"
 grep -Fq 'FAIL=0' "$OUTPUT"
 
 rm "$TEST_ROOT/sys/class/net/end0/phydev/name"

@@ -6,7 +6,6 @@ mtd-utils
 rsync
 smartmontools
 u-boot-tools
-usbutils
 util-linux
 xz-utils
 zstd

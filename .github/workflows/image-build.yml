@@ -38,6 +38,7 @@ on:
     paths:
       - '.github/workflows/image-build.yml'
       - 'packages/**'
+      - 'installer-card/**'
       - 'scripts/**'
       - 'tests/**'
       - 'userpatches/**'
@@ -58,6 +59,7 @@ env:
   LINUXFAMILY: sunxi
   KERNEL_BRANCH: current
   KERNEL_SERIES: '6.18'
+  KERNEL_GIT_REF: tag:v6.18.49
   RELEASE: noble
 
 jobs:
@@ -127,14 +129,25 @@ jobs:
           else
             build_minimal=yes
           fi
+          # pcDuino3B has an onboard USB Wi-Fi module.  Use one consistent
+          # stack for SD and recovery images so Wi-Fi can be configured with
+          # nmcli immediately after boot.
+          network_stack=network-manager
 
           case "$profile" in
-            nand-installer|nand-recovery)
-              boot_fdt_file=allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb
-              nand_controller_status=okay
+            nand-installer)
+              boot_fdt_file=allwinner/sun7i-a20-pcduino3b.dtb
+              nand_overlay=pcduino3b-nand-layout
+              nand_controller_status=okay-via-layout-overlay
+              ;;
+            nand-recovery)
+              boot_fdt_file=allwinner/sun7i-a20-pcduino3b.dtb
+              nand_overlay=pcduino3b-nand-recovery
+              nand_controller_status=okay-via-recovery-overlay
               ;;
             dev|sd-release)
               boot_fdt_file=allwinner/sun7i-a20-pcduino3b.dtb
+              nand_overlay=none
               nand_controller_status=disabled
               ;;
           esac
@@ -178,7 +191,7 @@ jobs:
           dts_hash=$(hash_paths userpatches/kernel)
           uboot_hash=$(hash_paths userpatches/config/boards/pcduino3b.csc userpatches/u-boot)
           packages_hash=$(hash_paths packages/common.txt "packages/${profile}.txt")
-          cache_base="armbian-${RUNNER_OS}-arm-${ARMBIAN_BUILD_REF}-${ARMBIAN_OS_REF}-${BOARDFAMILY}-${BOARD}-${KERNEL_BRANCH}-${KERNEL_SERIES}-${RELEASE}"
+          cache_base="armbian-${RUNNER_OS}-arm-${ARMBIAN_BUILD_REF}-${ARMBIAN_OS_REF}-${BOARDFAMILY}-${BOARD}-${KERNEL_BRANCH}-${KERNEL_SERIES}-${KERNEL_GIT_REF}-${RELEASE}"
 
           mkdir -p userpatches/overlay/etc
           printf '%s\n' "$profile" > userpatches/overlay/etc/pcduino3b-image-profile
@@ -189,8 +202,10 @@ jobs:
             echo "force=$force"
             echo "publish=$publish"
             echo "build_minimal=$build_minimal"
+            echo "network_stack=$network_stack"
             echo "boot_fdt_file=$boot_fdt_file"
             echo "nand_controller_status=$nand_controller_status"
+            echo "nand_overlay=$nand_overlay"
             echo "runner_clean=$runner_clean"
             echo "extra_packages=$extra_packages"
             echo "kernel_config_hash=$kernel_config_hash"
@@ -199,9 +214,12 @@ jobs:
             echo "packages_hash=$packages_hash"
             echo "cache_base=$cache_base"
             echo "artifact_cache_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
-            echo "artifact_restore_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-"
+            # Compiled packages are profile-sensitive: only NAND profiles enable
+            # the raw-NAND/FIT U-Boot feature set.  A broad fallback could silently
+            # restore an SD-only U-Boot package into a NAND image.
+            echo "artifact_restore_key=${cache_base}-artifacts-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
             echo "ccache_key=${cache_base}-ccache-${kernel_config_hash}-${dts_hash}-${uboot_hash}-${profile}"
-            echo "rootfs_key=${cache_base}-rootfs-${build_minimal}-${profile}-${packages_hash}"
+            echo "rootfs_key=${cache_base}-rootfs-${build_minimal}-${network_stack}-${profile}-${packages_hash}"
             echo "candidate_tag=pcduino3b-${profile}-candidate-${GITHUB_RUN_ID}"
           } >> "$GITHUB_OUTPUT"
 
@@ -274,7 +292,6 @@ jobs:
           key: ${{ steps.config.outputs.artifact_cache_key }}
           restore-keys: |
             ${{ steps.config.outputs.artifact_restore_key }}
-            ${{ steps.config.outputs.cache_base }}-artifacts-
 
       - name: Restore compiler cache
         id: ccache
@@ -292,7 +309,7 @@ jobs:
           path: build/cache/rootfs
           key: ${{ steps.config.outputs.rootfs_key }}
           restore-keys: |
-            ${{ steps.config.outputs.cache_base }}-rootfs-${{ steps.config.outputs.build_minimal }}-
+            ${{ steps.config.outputs.cache_base }}-rootfs-${{ steps.config.outputs.build_minimal }}-${{ steps.config.outputs.network_stack }}-${{ steps.config.outputs.profile }}-
 
       - name: Report restored cache sizes
         shell: bash
@@ -340,6 +357,39 @@ jobs:
           sudo chown -R "$USER:$USER" build
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
 
+      - name: Compile NAND overlay before Armbian cleanup
+        id: nand-overlay-blob
+        if: startsWith(steps.config.outputs.profile, 'nand-')
+        shell: bash
+        env:
+          OVERLAY_NAME: ${{ steps.config.outputs.nand_overlay }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends device-tree-compiler
+          # Runtime overlay names omit the SoC prefix, while the checked-in
+          # source files keep it to match the Linux DTS naming convention.
+          overlay_source="$GITHUB_WORKSPACE/userpatches/dts/sun7i-a20-${OVERLAY_NAME}.dtso"
+          [[ -s "$overlay_source" ]] || {
+            echo "NAND overlay source is missing before image build: $overlay_source" >&2
+            exit 1
+          }
+          overlay="$RUNNER_TEMP/${OVERLAY_NAME}.dtbo"
+          dtc_stderr="$RUNNER_TEMP/${OVERLAY_NAME}.stderr"
+          if ! dtc -@ -I dts -O dtb -o "$overlay" \
+            "$overlay_source" 2>"$dtc_stderr"; then
+            echo "Failed to compile NAND overlay: $overlay_source" >&2
+            cat "$dtc_stderr" >&2
+            exit 1
+          fi
+          [[ ! -s "$dtc_stderr" ]] || {
+            cat "$dtc_stderr" >&2
+            exit 1
+          }
+          [[ -s "$overlay" ]]
+          echo "NAND_OVERLAY_PRECOMPILE=PASS"
+          echo "blob=$overlay" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$overlay" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
       - name: Build raw image
         id: armbian
         shell: bash
@@ -358,10 +408,12 @@ jobs:
             REVISION="$ARMBIAN_VERSION"
             BOARD="$BOARD"
             BRANCH="$KERNEL_BRANCH"
+            KERNELBRANCH="$KERNEL_GIT_REF"
             RELEASE="$RELEASE"
             KERNEL_CONFIGURE=no
             BUILD_DESKTOP=no
             BUILD_MINIMAL="$BUILD_MINIMAL"
+            NETWORKING_STACK="${{ steps.config.outputs.network_stack }}"
             ENABLE_EXTENSIONS=pcduino3b-gigabit
             COMPRESS_OUTPUTIMAGE=img
             PCDUINO3B_EXTRA_PACKAGES="$PCDUINO3B_EXTRA_PACKAGES"
@@ -382,6 +434,168 @@ jobs:
             | sed -n "s/.*Section '\([^']*\)' took \([0-9][0-9]*\)s.*/\1 \2/p" \
             > "$RUNNER_TEMP/armbian-sections.txt"
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      # Preserve the expensive build as soon as Armbian has completed. Image
+      # injection, acceptance or release failures must not throw away a valid
+      # kernel/U-Boot build and rootfs cache.
+      - name: Save compiled artifact cache after raw build
+        if: steps.armbian.outcome == 'success' && steps.artifact-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            build/output/packages-hashed
+            build/output/debs
+          key: ${{ steps.config.outputs.artifact_cache_key }}
+
+      - name: Save compiler cache after raw build
+        if: steps.armbian.outcome == 'success' && steps.ccache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/cache/ccache
+          key: ${{ steps.config.outputs.ccache_key }}
+
+      - name: Save rootfs cache after raw build
+        if: steps.armbian.outcome == 'success' && steps.rootfs-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/cache/rootfs
+          key: ${{ steps.config.outputs.rootfs_key }}
+
+      - name: Inject hardware-accepted NAND overlay path
+        id: nand-overlay
+        if: startsWith(steps.config.outputs.profile, 'nand-')
+        shell: bash
+        env:
+          PROFILE: ${{ steps.config.outputs.profile }}
+          OVERLAY_NAME: ${{ steps.config.outputs.nand_overlay }}
+          OVERLAY_BLOB: ${{ steps.nand-overlay-blob.outputs.blob }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            device-tree-compiler initramfs-tools-core
+
+          mapfile -t images < <(find build/output/images -maxdepth 1 -type f -name '*.img' | sort)
+          if ((${#images[@]} != 1)); then
+            printf 'Expected exactly one raw image, got %d\n' "${#images[@]}" >&2
+            printf '  %s\n' "${images[@]}" >&2
+            exit 1
+          fi
+          raw_image=${images[0]}
+          echo "NAND_OVERLAY_RAW_IMAGE=$raw_image"
+          # Armbian cleans userpatches/dts after assembly. Use the immutable
+          # blob compiled into RUNNER_TEMP before starting the image build.
+          overlay="$OVERLAY_BLOB"
+          [[ -s "$overlay" ]] || {
+            echo "Precompiled NAND overlay is missing: $overlay" >&2
+            exit 1
+          }
+          echo "NAND_OVERLAY_COMPILE=PASS"
+
+          mount_dir=$(mktemp -d)
+          loop_device=$(sudo losetup --find --show --partscan "$raw_image")
+          cleanup() {
+            sudo umount "$mount_dir" 2>/dev/null || true
+            sudo losetup -d "$loop_device" 2>/dev/null || true
+            rmdir "$mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sudo udevadm settle
+          root_part=$(lsblk -lnpo NAME,FSTYPE "$loop_device" \
+            | awk '$2 == "ext4" || $2 == "btrfs" { print $1; exit }')
+          [[ -n "$root_part" ]] || { lsblk -f "$loop_device" >&2; exit 1; }
+          sudo mount "$root_part" "$mount_dir"
+          echo "NAND_OVERLAY_ROOT_PART=$root_part"
+
+          mapfile -t base_dtbs < <(
+            sudo find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb -print
+          )
+          if ((${#base_dtbs[@]} != 1)); then
+            echo "Expected one base DTB, found ${#base_dtbs[@]}" >&2
+            printf '  %s\n' "${base_dtbs[@]}" >&2
+            exit 1
+          fi
+          composed="$RUNNER_TEMP/${OVERLAY_NAME}-check.dtb"
+          if ! fdtoverlay -i "${base_dtbs[0]}" -o "$composed" "$overlay"; then
+            echo "Failed to compose $overlay with ${base_dtbs[0]}" >&2
+            exit 1
+          fi
+          echo "NAND_OVERLAY_COMPOSE=PASS"
+          echo "NAND_OVERLAY_MODEL=$(fdtget -t s "$composed" / model)"
+          echo "NAND_OVERLAY_PHY_MODE=$(fdtget -t s "$composed" /soc/ethernet@1c50000 phy-mode)"
+          [[ "$(fdtget -t s "$composed" / model)" == 'LinkSprite pcDuino3B' ]]
+          [[ "$(fdtget -t s "$composed" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
+          nfc=/soc/nand-controller@1c03000
+          nand=$nfc/nand@0
+          echo "NAND_OVERLAY_NFC_STATUS=$(fdtget -t s "$composed" "$nfc" status)"
+          echo "NAND_OVERLAY_REG=$(fdtget -t x "$composed" "$nand" reg)"
+          echo "NAND_OVERLAY_RB=$(fdtget -t x "$composed" "$nand" allwinner,rb)"
+          echo "NAND_OVERLAY_ECC_MODE=$(fdtget -t s "$composed" "$nand" nand-ecc-mode)"
+          [[ "$(fdtget -t s "$composed" "$nfc" status)" == okay ]]
+          [[ "$(fdtget -t x "$composed" "$nand" reg)" == 0 ]]
+          [[ "$(fdtget -t x "$composed" "$nand" allwinner,rb)" == 0 ]]
+          [[ "$(fdtget -t s "$composed" "$nand" nand-ecc-mode)" == hw ]]
+
+          if [[ "$PROFILE" == nand-installer ]]; then
+            partitions=$nand/partitions
+            fdtget -p "$composed" "$partitions"
+            for partition in \
+              partition@0 \
+              partition@400000 \
+              partition@800000 \
+              partition@2000000 \
+              partition@8000000; do
+              echo "NAND_OVERLAY_PARTITION=$partition label=$(fdtget -t s "$composed" "$partitions/$partition" label) reg=$(fdtget -t x "$composed" "$partitions/$partition" reg)"
+            done
+            [[ "$(fdtget -t s "$composed" "$partitions" compatible)" == fixed-partitions ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@0" label)" == spl-primary ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@0" reg)" == '0 400000' ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@400000" label)" == spl-backup ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@400000" reg)" == '400000 400000' ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@800000" label)" == uboot ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@800000" reg)" == '800000 1800000' ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@2000000" label)" == bootfit ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@2000000" reg)" == '2000000 6000000' ]]
+            [[ "$(fdtget -t s "$composed" "$partitions/partition@8000000" label)" == rootfs ]]
+            [[ "$(fdtget -t x "$composed" "$partitions/partition@8000000" reg)" == '8000000 f8000000' ]]
+            fdtget -p "$composed" "$partitions/partition@8000000" | grep -qx slc-mode
+          elif fdtget -l "$composed" "$nand" | grep -qx partitions; then
+            echo 'Recovery overlay must not declare NAND partitions' >&2
+            exit 1
+          fi
+
+          overlay_target="$mount_dir/boot/overlay-user/${OVERLAY_NAME}.dtbo"
+          sudo install -D -m 0644 "$overlay" "$overlay_target"
+          boot_env="$mount_dir/boot/armbianEnv.txt"
+          sudo sed -i \
+            's|^fdtfile=.*$|fdtfile=allwinner/sun7i-a20-pcduino3b.dtb|' \
+            "$boot_env"
+          sudo sed -i '/^user_overlays=/d' "$boot_env"
+          printf '%s\n' "user_overlays=$OVERLAY_NAME" \
+            | sudo tee -a "$boot_env" >/dev/null
+
+          if [[ "$PROFILE" == nand-recovery ]]; then
+            if sudo grep -q '^extraargs=' "$boot_env"; then
+              if ! sudo grep -Eq '^extraargs=.*modprobe\.blacklist=sunxi_nand([[:space:]]|$)' "$boot_env"; then
+                sudo sed -i '/^extraargs=/ s/$/ modprobe.blacklist=sunxi_nand/' "$boot_env"
+              fi
+            else
+              printf '%s\n' 'extraargs=modprobe.blacklist=sunxi_nand' \
+                | sudo tee -a "$boot_env" >/dev/null
+            fi
+          else
+            sudo sed -i '/^extraargs=/ s/modprobe\.blacklist=sunxi_nand//g' "$boot_env"
+            sudo rm -f "$mount_dir/etc/modprobe.d/pcduino3b-nand-recovery.conf"
+          fi
+
+          sudo grep -Fxq 'fdtfile=allwinner/sun7i-a20-pcduino3b.dtb' "$boot_env"
+          sudo grep -Fxq "user_overlays=$OVERLAY_NAME" "$boot_env"
+          sudo cmp "$overlay" "$overlay_target"
+          sync
+          echo "blob=$overlay" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$overlay" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Accept uncompressed image
         id: acceptance
@@ -453,26 +667,203 @@ jobs:
           sudo grep -qx 'IMAGE_PROFILE=${{ steps.config.outputs.profile }}' "$mount_dir/etc/pcduino3b-build-info"
           sudo grep -Rqs --include='*.list' --include='*.sources' noble "$mount_dir/etc/apt"
           sudo bash -n "$mount_dir/usr/local/sbin/pcduino3b-selftest"
+
+          for package in \
+            armbian-firmware \
+            iw \
+            network-manager \
+            wireless-regdb \
+            wpasupplicant; do
+            sudo dpkg-query \
+              --admindir="$mount_dir/var/lib/dpkg" \
+              --showformat='${db:Status-Abbrev}\n' \
+              --show "$package" | grep -qx 'ii '
+          done
+          for firmware in \
+            rtlwifi/rtl8188eufw.bin \
+            rtlwifi/rtl8192cufw.bin \
+            rtlwifi/rtl8192cufw_A.bin \
+            rtlwifi/rtl8192cufw_B.bin \
+            rtlwifi/rtl8192cufw_TMSC.bin; do
+            sudo test -s "$mount_dir/lib/firmware/$firmware"
+          done
           nand_probe="$mount_dir/usr/local/sbin/pcduino3b-nand-probe"
+          nand_install="$mount_dir/usr/local/sbin/pcduino3b-nand-install"
+          nand_layout="$mount_dir/usr/share/pcduino3b/nand-layout.env"
           case '${{ steps.config.outputs.profile }}' in
             nand-installer|nand-recovery)
               sudo test -x "$nand_probe"
               sudo bash -n "$nand_probe"
+              sudo test -s "$nand_layout"
+              mapfile -t nand_spl_files < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name pcduino3b-nand-spl-with-ecc.bin -print
+              )
+              mapfile -t nand_uboot_files < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name pcduino3b-nand-u-boot.bin -print
+              )
+              [[ ${#nand_spl_files[@]} -eq 1 && ${#nand_uboot_files[@]} -eq 1 ]] || {
+                echo "Expected one NAND SPL and one NAND U-Boot; found SPL=${#nand_spl_files[@]} U-Boot=${#nand_uboot_files[@]}" >&2
+                exit 1
+              }
+              mapfile -t sd_uboot_files < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name u-boot-sunxi-with-spl.bin -print
+              )
+              mapfile -t sd_uboot_configs < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name u-boot-config-target-1 -print
+              )
+              mapfile -t nand_uboot_configs < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name u-boot-config-target-2 -print
+              )
+              [[ ${#sd_uboot_files[@]} -eq 1 ]] || {
+                echo "Expected one installer-SD U-Boot; found ${#sd_uboot_files[@]}" >&2
+                exit 1
+              }
+              [[ ${#sd_uboot_configs[@]} -eq 1 && ${#nand_uboot_configs[@]} -eq 1 ]] || {
+                echo "Expected one config per U-Boot target; found SD=${#sd_uboot_configs[@]} NAND=${#nand_uboot_configs[@]}" >&2
+                exit 1
+              }
+
+              # The card itself must contain the MMC-only target at the exact
+              # sunxi boot offset.  The separately packaged target is the only
+              # one allowed to initialize NAND and is never written to the SD.
+              for option in \
+                CONFIG_MTD_RAW_NAND \
+                CONFIG_NAND_SUNXI \
+                CONFIG_CMD_NAND \
+                CONFIG_SPL_NAND_SUPPORT; do
+                # Kconfig omits symbols whose parent menu is disabled, so an
+                # absent line and "# ... is not set" both mean disabled.  The
+                # safety property is that none of these symbols is enabled.
+                if sudo grep -Eq "^${option}=y$" "${sd_uboot_configs[0]}"; then
+                  echo "Installer SD U-Boot unexpectedly enables $option" >&2
+                  exit 1
+                fi
+              done
+              for option in \
+                CONFIG_MTD_RAW_NAND=y \
+                CONFIG_NAND_SUNXI=y \
+                CONFIG_CMD_NAND=y \
+                CONFIG_SPL_NAND_SUPPORT=y \
+                CONFIG_SYS_NAND_PAGE_SIZE=0x2000 \
+                CONFIG_SYS_NAND_OOBSIZE=0x280; do
+                sudo grep -Fxq "$option" "${nand_uboot_configs[0]}" || {
+                  echo "NAND U-Boot config is missing $option" >&2
+                  exit 1
+                }
+              done
+              sd_uboot_bytes=$(sudo stat -c %s "${sd_uboot_files[0]}")
+              ((sd_uboot_bytes > 0 && sd_uboot_bytes < 1040384)) || {
+                echo "Installer-SD U-Boot has invalid size: $sd_uboot_bytes" >&2
+                exit 1
+              }
+              sudo cmp --bytes="$sd_uboot_bytes" --ignore-initial=8192:0 \
+                "$raw_image" "${sd_uboot_files[0]}" || {
+                  echo 'Installer image does not contain the MMC-only U-Boot at offset 8192' >&2
+                  exit 1
+                }
+              # 24 physical pages, each containing 8192 data + 640 OOB bytes.
+              nand_spl_bytes=$(sudo stat -c %s "${nand_spl_files[0]}")
+              [[ "$nand_spl_bytes" -eq 211968 ]] || {
+                echo "NAND SPL has invalid encoded size: $nand_spl_bytes" >&2
+                exit 1
+              }
+              nand_uboot_bytes=$(sudo stat -c %s "${nand_uboot_files[0]}")
+              ((nand_uboot_bytes > 0 && nand_uboot_bytes <= 0xc0000)) || {
+                echo "NAND U-Boot has invalid size: $nand_uboot_bytes" >&2
+                exit 1
+              }
+              sudo grep -aFq 'H27UBG8T2CTR-BC' "${nand_uboot_files[0]}" || {
+                echo 'NAND U-Boot lacks the H27UBG8T2CTR-BC device entry' >&2
+                exit 1
+              }
+              sudo grep -aFq 'nand read 0x50000000 0x02000000 0x04000000' \
+                "${nand_uboot_files[0]}" || {
+                  echo 'NAND U-Boot lacks the raw FIT read command' >&2
+                  exit 1
+                }
+              sudo grep -aFq 'bootm 0x50000000' "${nand_uboot_files[0]}" || {
+                echo 'NAND U-Boot lacks the FIT boot command' >&2
+                exit 1
+              }
+              if sudo grep -aFq 'bootcmd_ubifs0=' "${nand_uboot_files[0]}"; then
+                echo 'U-Boot must not read the SLC-emulated rootfs UBI' >&2
+                exit 1
+              fi
               ;;
             dev|sd-release)
               sudo test ! -e "$nand_probe"
+              sudo test ! -e "$nand_install"
+              sudo test ! -e "$nand_layout"
+              ! sudo find "$mount_dir/usr/lib" -type f \
+                \( -name pcduino3b-nand-spl-with-ecc.bin \
+                -o -name pcduino3b-nand-u-boot.bin \) -print -quit \
+                | grep -q .
+              ;;
+          esac
+          case '${{ steps.config.outputs.profile }}' in
+            nand-installer)
+              sudo test -x "$nand_install"
+              sudo bash -n "$nand_install"
+              sudo grep -Fxq sunxi_nand "$mount_dir/etc/initramfs-tools/modules"
+              initrd=$(find "$mount_dir/boot" -maxdepth 1 -type f -name 'initrd.img-*' | sort | tail -n1)
+              [[ -n "$initrd" ]]
+              sudo lsinitramfs "$initrd" \
+                | grep -E '/(sunxi_nand|nand)\.ko([.]|$)' >/dev/null
+              sudo test ! -e "$mount_dir/etc/modprobe.d/pcduino3b-nand-recovery.conf"
+              ;;
+            nand-recovery)
+              sudo test ! -e "$nand_install"
+              sudo grep -Fxq 'blacklist sunxi_nand' \
+                "$mount_dir/etc/modprobe.d/pcduino3b-nand-recovery.conf"
               ;;
           esac
 
-          kernel_config=$(find "$mount_dir/boot" -maxdepth 1 -type f -name 'config-*' | sort | tail -n1)
-          [[ -n "$kernel_config" ]] || { echo 'Kernel config not found' >&2; exit 1; }
+          mapfile -t kernel_configs < <(
+            find "$mount_dir/boot" -maxdepth 1 -type f -name 'config-*' | sort
+          )
+          ((${#kernel_configs[@]} == 1)) || {
+            echo "Expected exactly one kernel config, found ${#kernel_configs[@]}" >&2
+            exit 1
+          }
+          kernel_config=${kernel_configs[0]}
+          [[ "$(basename "$kernel_config")" == config-6.18.49-current-sunxi ]]
+          kernel_image=$(readlink -f "$mount_dir/boot/zImage")
+          [[ "$(basename "$kernel_image")" == vmlinuz-6.18.49-current-sunxi ]]
           for option in \
             CONFIG_STMMAC_ETH=y \
             CONFIG_STMMAC_PLATFORM=y \
             CONFIG_DWMAC_SUNXI=y \
-            CONFIG_REALTEK_PHY=y; do
+            CONFIG_REALTEK_PHY=y \
+            CONFIG_USB=y \
+            CONFIG_USB_EHCI_HCD=y \
+            CONFIG_USB_EHCI_HCD_PLATFORM=y \
+            CONFIG_USB_OHCI_HCD=y \
+            CONFIG_USB_OHCI_HCD_PLATFORM=y \
+            CONFIG_CFG80211=m \
+            CONFIG_MAC80211=m \
+            CONFIG_RTL8192CU=m \
+            CONFIG_RTL8XXXU=m; do
             sudo grep -qx "$option" "$kernel_config"
           done
+          for module in rtl8192cu rtl8xxxu; do
+            sudo find "$mount_dir/usr/lib/modules" -type f \
+              -name "${module}.ko*" -print -quit | grep -q .
+          done
+          if [[ '${{ steps.config.outputs.profile }}' == nand-installer ]]; then
+            for option in \
+              CONFIG_MTD=y \
+              CONFIG_MTD_RAW_NAND=m \
+              CONFIG_MTD_NAND_SUNXI=m \
+              CONFIG_MTD_UBI=y \
+              CONFIG_UBIFS_FS=y; do
+              sudo grep -qx "$option" "$kernel_config"
+            done
+          fi
 
           base_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b.dtb | head -n1)
           recovery_dtb=$(find "$mount_dir/boot" -type f -name sun7i-a20-pcduino3b-nand-recovery.dtb | head -n1)
@@ -497,6 +888,14 @@ jobs:
           base_nfc=/soc/nand-controller@1c03000
           recovery_nand=$base_nfc/nand@0
           [[ "$(sudo fdtget -t s "$base_dtb" "$base_nfc" status)" == disabled ]]
+          for usb_node in \
+            /soc/usb@1c14000 \
+            /soc/usb@1c14400 \
+            /soc/usb@1c1c000 \
+            /soc/usb@1c1c400; do
+            [[ "$(sudo fdtget -t s "$base_dtb" "$usb_node" status)" == okay ]]
+            [[ "$(sudo fdtget -t s "$recovery_dtb" "$usb_node" status)" == okay ]]
+          done
           [[ "$(sudo fdtget -t s "$recovery_dtb" "$base_nfc" status)" == okay ]]
           [[ "$(sudo fdtget -t x "$recovery_dtb" "$recovery_nand" reg)" == 0 ]]
           [[ "$(sudo fdtget -t x "$recovery_dtb" "$recovery_nand" allwinner,rb)" == 0 ]]
@@ -512,6 +911,39 @@ jobs:
 
           expected_fdt='${{ steps.config.outputs.boot_fdt_file }}'
           sudo grep -Fxq "fdtfile=$expected_fdt" "$mount_dir/boot/armbianEnv.txt"
+          expected_overlay='${{ steps.config.outputs.nand_overlay }}'
+          case '${{ steps.config.outputs.profile }}' in
+            nand-installer|nand-recovery)
+              overlay_blob="$mount_dir/boot/overlay-user/${expected_overlay}.dtbo"
+              sudo test -s "$overlay_blob"
+              sudo grep -Fxq "user_overlays=$expected_overlay" \
+                "$mount_dir/boot/armbianEnv.txt"
+              composed="$RUNNER_TEMP/${expected_overlay}-acceptance.dtb"
+              sudo fdtoverlay -i "$base_dtb" -o "$composed" "$overlay_blob"
+              [[ "$(sudo fdtget -t s "$composed" "$base_nfc" status)" == okay ]]
+              [[ "$(sudo fdtget -t s "$composed" /soc/ethernet@1c50000 phy-mode)" == rgmii-id ]]
+              if [[ '${{ steps.config.outputs.profile }}' == nand-installer ]]; then
+                partitions=$recovery_nand/partitions
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@0" label)" == spl-primary ]]
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@400000" label)" == spl-backup ]]
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@800000" label)" == uboot ]]
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@2000000" label)" == bootfit ]]
+                [[ "$(sudo fdtget -t s "$composed" "$partitions/partition@8000000" label)" == rootfs ]]
+                sudo fdtget -p "$composed" "$partitions/partition@8000000" \
+                  | grep -qx slc-mode
+              elif sudo fdtget -l "$composed" "$recovery_nand" | grep -qx partitions; then
+                echo 'Recovery overlay unexpectedly contains partitions' >&2
+                exit 1
+              fi
+              ;;
+            dev|sd-release)
+              if sudo grep -q '^user_overlays=pcduino3b-nand-' \
+                "$mount_dir/boot/armbianEnv.txt"; then
+                echo 'SD-only image unexpectedly enables a NAND overlay' >&2
+                exit 1
+              fi
+              ;;
+          esac
 
           raw_bytes=$(stat -c %s "$raw_image")
           raw_sha256=$(sha256sum "$raw_image" | awk '{print $1}')
@@ -523,11 +955,310 @@ jobs:
             echo "seconds=$(( $(date +%s) - started ))"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Compress accepted image and test stream
-        id: compression
+      - name: Build accepted NAND rootfs and installer bundle
+        id: nand-payload
+        if: steps.config.outputs.profile == 'nand-installer'
         shell: bash
         env:
           RAW_IMAGE: ${{ steps.acceptance.outputs.raw_image }}
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          sudo apt-get install -y --no-install-recommends mtd-utils u-boot-tools zstd
+
+          mount_dir=$(mktemp -d)
+          rootfs_dir=$(mktemp -d)
+          payload_dir="$RUNNER_TEMP/pcduino3b-nand-payload"
+          mkdir -p "$payload_dir"
+          loop_device=$(sudo losetup --find --show --partscan "$RAW_IMAGE")
+          cleanup() {
+            sudo umount "$mount_dir" 2>/dev/null || true
+            sudo losetup -d "$loop_device" 2>/dev/null || true
+            sudo rm -rf "$rootfs_dir"
+            rmdir "$mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sudo udevadm settle
+          root_part=$(lsblk -lnpo NAME,FSTYPE "$loop_device" \
+            | awk '$2 == "ext4" || $2 == "btrfs" { print $1; exit }')
+          [[ -n "$root_part" ]]
+          sudo mount -o ro "$root_part" "$mount_dir"
+
+          mapfile -t spl_files < <(
+            sudo find "$mount_dir/usr/lib" -type f \
+              -name pcduino3b-nand-spl-with-ecc.bin -print
+          )
+          mapfile -t uboot_files < <(
+            sudo find "$mount_dir/usr/lib" -type f \
+              -name pcduino3b-nand-u-boot.bin -print
+          )
+          [[ ${#spl_files[@]} -eq 1 && ${#uboot_files[@]} -eq 1 ]]
+          sudo install -m 0644 "${spl_files[0]}" \
+            "$payload_dir/pcduino3b-nand-spl-with-ecc.bin"
+          sudo install -m 0644 "${uboot_files[0]}" \
+            "$payload_dir/pcduino3b-nand-u-boot.bin"
+          sudo install -m 0644 \
+            "$mount_dir/usr/share/pcduino3b/nand-layout.env" \
+            "$payload_dir/pcduino3b-nand-layout.env"
+          sudo install -m 0755 \
+            "$mount_dir/usr/local/sbin/pcduino3b-nand-install" \
+            "$payload_dir/pcduino3b-nand-install"
+          sudo install -m 0644 \
+            "$mount_dir/boot/overlay-user/pcduino3b-nand-layout.dtbo" \
+            "$payload_dir/pcduino3b-nand-layout.dtbo"
+
+          kernel=$(readlink -f "$mount_dir/boot/zImage")
+          kernel_release=${kernel##*/vmlinuz-}
+          initrd="$mount_dir/boot/initrd.img-$kernel_release"
+          [[ -s "$kernel" && -s "$initrd" ]]
+          gzip -t "$initrd"
+          mapfile -t base_dtbs < <(
+            sudo find "$mount_dir/boot" -type f \
+              -name sun7i-a20-pcduino3b.dtb -print
+          )
+          [[ ${#base_dtbs[@]} -eq 1 ]]
+          runtime_dtb="$RUNNER_TEMP/sun7i-a20-pcduino3b-nand-runtime.dtb"
+          sudo fdtoverlay -i "${base_dtbs[0]}" -o "$runtime_dtb" \
+            "$payload_dir/pcduino3b-nand-layout.dtbo"
+          rootfs_partition=/soc/nand-controller@1c03000/nand@0/partitions/partition@8000000
+          sudo fdtget -p "$runtime_dtb" "$rootfs_partition" | grep -qx slc-mode
+          # UBI is built in while sunxi_nand is loaded by the initramfs.  Mark
+          # only the FIT's runtime partition for the MTD notifier to attach as
+          # soon as the module registers it.  The SD installer overlay remains
+          # unmarked so its pre-write guard always starts with UBI detached.
+          sudo fdtput -t s "$runtime_dtb" "$rootfs_partition" \
+            compatible linux,ubi
+          [[ "$(sudo fdtget -t s "$runtime_dtb" "$rootfs_partition" compatible)" == linux,ubi ]]
+
+          fit_dir="$RUNNER_TEMP/pcduino3b-nand-fit"
+          mkdir -p "$fit_dir"
+          ln -s "$kernel" "$fit_dir/zImage"
+          ln -s "$initrd" "$fit_dir/initrd.img"
+          ln -s "$runtime_dtb" "$fit_dir/pcduino3b-nand-runtime.dtb"
+          kernel_bytes=$(stat -c %s "$kernel")
+          initrd_bytes=$(stat -c %s "$initrd")
+          runtime_dtb_bytes=$(stat -c %s "$runtime_dtb")
+          ((0x42000000 + kernel_bytes <= 0x43000000)) || {
+            echo "Kernel overlaps the FIT FDT load address: $kernel_bytes bytes" >&2
+            exit 1
+          }
+          ((0x43000000 + runtime_dtb_bytes <= 0x43400000)) || {
+            echo "Runtime DTB overlaps the FIT initramfs load address: $runtime_dtb_bytes bytes" >&2
+            exit 1
+          }
+          ((0x43400000 + initrd_bytes <= 0x50000000)) || {
+            echo "Initramfs overlaps the raw FIT read buffer: $initrd_bytes bytes" >&2
+            exit 1
+          }
+          install -m 0644 userpatches/pcduino3b-nand-boot.its \
+            "$fit_dir/pcduino3b-nand-boot.its"
+          boot_fit="$payload_dir/pcduino3b-nand-boot.itb"
+          (
+            cd "$fit_dir"
+            SOURCE_DATE_EPOCH=$(git -C "$GITHUB_WORKSPACE" show -s --format=%ct "$GITHUB_SHA") \
+              mkimage -f pcduino3b-nand-boot.its "$boot_fit"
+          )
+          dumpimage -l "$boot_fit" | tee "$RUNNER_TEMP/pcduino3b-nand-boot-fit.txt"
+          grep -Fq 'pcDuino3B NAND boot FIT' "$RUNNER_TEMP/pcduino3b-nand-boot-fit.txt"
+          grep -Fq 'Hash algo:    sha256' "$RUNNER_TEMP/pcduino3b-nand-boot-fit.txt"
+
+          # Build the NAND filesystem from an immutable copy of the accepted
+          # SD candidate.  The running installer itself is not copied into the
+          # NAND system, and all boot-critical root settings are rewritten.
+          sudo rsync -aHAX --numeric-ids "$mount_dir/" "$rootfs_dir/"
+          sudo rm -f "$rootfs_dir/usr/local/sbin/pcduino3b-nand-install"
+          sudo rm -f "$rootfs_dir/etc/modprobe.d/pcduino3b-nand-recovery.conf"
+          sudo sed -i 's/^IMAGE_PROFILE=.*$/IMAGE_PROFILE=nand-rootfs/' \
+            "$rootfs_dir/etc/pcduino3b-build-info"
+          if [[ -f "$rootfs_dir/etc/pcduino3b-image-profile" ]]; then
+            printf '%s\n' nand-rootfs \
+              | sudo tee "$rootfs_dir/etc/pcduino3b-image-profile" >/dev/null
+          fi
+
+          boot_env="$rootfs_dir/boot/armbianEnv.txt"
+          sudo sed -i \
+            -e '/^rootdev=/d' \
+            -e '/^rootfstype=/d' \
+            -e '/^fdtfile=/d' \
+            -e '/^user_overlays=/d' \
+            -e '/^extraargs=/d' \
+            "$boot_env"
+          printf '%s\n' \
+            'fdtfile=allwinner/sun7i-a20-pcduino3b.dtb' \
+            'user_overlays=pcduino3b-nand-layout' \
+            'rootdev=ubi0:rootfs' \
+            'rootfstype=ubifs' \
+            'extraargs=ubi.mtd=rootfs' \
+            | sudo tee -a "$boot_env" >/dev/null
+          sudo sed -i -E \
+            '\|^[^#]+[[:space:]]+/[[:space:]]+|c\ubi0:rootfs / ubifs defaults,noatime 0 0' \
+            "$rootfs_dir/etc/fstab"
+
+          sudo grep -Fxq sunxi_nand "$rootfs_dir/etc/initramfs-tools/modules"
+          sudo grep -Fxq 'rootdev=ubi0:rootfs' "$boot_env"
+          sudo grep -Fxq 'rootfstype=ubifs' "$boot_env"
+          sudo grep -Fxq 'extraargs=ubi.mtd=rootfs' "$boot_env"
+          sudo grep -Fxq 'ubi0:rootfs / ubifs defaults,noatime 0 0' \
+            "$rootfs_dir/etc/fstab"
+          sudo test -s "$rootfs_dir/boot/boot.scr"
+          sudo test -s "$rootfs_dir/boot/zImage"
+          sudo test -s "$rootfs_dir/boot/uInitrd"
+
+          ubifs="$RUNNER_TEMP/pcduino3b-nand-rootfs.ubifs"
+          ubi="$payload_dir/pcduino3b-nand-rootfs.ubi"
+          sudo mkfs.ubifs \
+            --min-io-size 8192 \
+            --leb-size 1032192 \
+            --max-leb-cnt 1984 \
+            --compr favor_lzo \
+            --favor-percent 20 \
+            --root "$rootfs_dir" \
+            --output "$ubifs"
+          ubinize_ini="$RUNNER_TEMP/pcduino3b-nand-rootfs.ini"
+          {
+            echo '[rootfs]'
+            echo 'mode=ubi'
+            echo "image=$ubifs"
+            echo 'vol_id=0'
+            echo 'vol_type=dynamic'
+            echo 'vol_name=rootfs'
+            echo 'vol_flags=autoresize'
+          } > "$ubinize_ini"
+          sudo ubinize \
+            --output "$ubi" \
+            --peb-size 1048576 \
+            --min-io-size 8192 \
+            --sub-page-size 8192 \
+            --vid-hdr-offset 8192 \
+            "$ubinize_ini"
+          sudo rm -f "$ubifs"
+          sudo chown -R "$USER:$USER" "$payload_dir"
+
+          rootfs_bytes=$(stat -c %s "$ubi")
+          ((rootfs_bytes > 0 && rootfs_bytes % 1048576 == 0))
+          bootfit_bytes=$(stat -c %s "$boot_fit")
+          ((bootfit_bytes > 0 && bootfit_bytes <= 67108864))
+          spl_bytes=$(stat -c %s "$payload_dir/pcduino3b-nand-spl-with-ecc.bin")
+          ((spl_bytes > 0 && spl_bytes % 8832 == 0))
+          uboot_bytes=$(stat -c %s "$payload_dir/pcduino3b-nand-u-boot.bin")
+          ((uboot_bytes > 0 && uboot_bytes <= 786432))
+
+          manifest="$payload_dir/pcduino3b-nand-manifest.txt"
+          {
+            echo 'FORMAT_VERSION=2'
+            echo 'BOARD=pcduino3b'
+            echo 'BOARD_NAME=pcDuino3B'
+            echo 'PROFILE=nand-rootfs'
+            echo "REPOSITORY_COMMIT=$GITHUB_SHA"
+            echo 'NAND_ID=add794916044'
+            echo 'NAND_TOTAL_BYTES=4294967296'
+            echo 'NAND_PAGE_BYTES=8192'
+            echo 'NAND_OOB_BYTES=640'
+            echo 'NAND_ERASE_BYTES=2097152'
+            echo 'NAND_ECC=40/1024'
+            echo 'SPL_PRIMARY_OFFSET=0x00000000'
+            echo 'SPL_BACKUP_OFFSET=0x00400000'
+            echo 'UBOOT_OFFSET=0x00800000'
+            echo 'BOOTFIT_OFFSET=0x02000000'
+            echo 'BOOTFIT_REGION_BYTES=100663296'
+            echo 'BOOTFIT_READ_BYTES=67108864'
+            echo "BOOTFIT_BYTES=$bootfit_bytes"
+            echo 'ROOTFS_PHYSICAL_OFFSET=0x08000000'
+            echo 'ROOTFS_SLC_EMULATION=dist6'
+            echo 'ROOTFS_AUTO_ATTACH=linux,ubi'
+            echo "FIT_KERNEL_BYTES=$kernel_bytes"
+            echo "FIT_INITRD_BYTES=$initrd_bytes"
+            echo 'FIT_INITRD_PAYLOAD_COMPRESSION=gzip'
+            echo 'FIT_INITRD_FIT_COMPRESSION=none'
+            echo "FIT_RUNTIME_DTB_BYTES=$runtime_dtb_bytes"
+            echo 'ROOTFS_PEB_BYTES=1048576'
+            echo 'ROOTFS_LEB_BYTES=1032192'
+            echo 'UBI_VOLUME=rootfs'
+            echo "ROOTFS_UBI_BYTES=$rootfs_bytes"
+            echo "SPL_BYTES=$spl_bytes"
+            echo "UBOOT_BYTES=$uboot_bytes"
+          } > "$manifest"
+          (
+            cd "$payload_dir"
+            sha256sum -b \
+              pcduino3b-nand-rootfs.ubi \
+              pcduino3b-nand-boot.itb \
+              pcduino3b-nand-spl-with-ecc.bin \
+              pcduino3b-nand-u-boot.bin \
+              pcduino3b-nand-layout.env \
+              pcduino3b-nand-layout.dtbo \
+              pcduino3b-nand-install \
+              pcduino3b-nand-manifest.txt \
+              > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+          source_date_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          bundle="$GITHUB_WORKSPACE/pcduino3b-nand-installer-${GITHUB_RUN_ID}.tar.zst"
+          tar --sort=name --mtime="@$source_date_epoch" \
+            --numeric-owner --owner=0 --group=0 \
+            -C "$payload_dir" -cf - . \
+            | zstd -T0 -10 -o "$bundle"
+          zstd -t "$bundle"
+          zstd -dc "$bundle" | tar -tf - | sort
+          bundle_sha_file="${bundle}.sha256"
+          (
+            cd "$(dirname "$bundle")"
+            sha256sum -b "$(basename "$bundle")" \
+              > "$(basename "$bundle_sha_file")"
+          )
+
+          {
+            echo "bundle=$bundle"
+            echo "sha_file=$bundle_sha_file"
+            echo "bundle_sha256=$(sha256sum "$bundle" | awk '{print $1}')"
+            echo "bundle_bytes=$(stat -c %s "$bundle")"
+            echo "rootfs_ubi_sha256=$(sha256sum "$ubi" | awk '{print $1}')"
+            echo "rootfs_ubi_bytes=$rootfs_bytes"
+            echo "bootfit_sha256=$(sha256sum "$boot_fit" | awk '{print $1}')"
+            echo "bootfit_bytes=$bootfit_bytes"
+            echo "payload_dir=$payload_dir"
+            echo "seconds=$(( $(date +%s) - started ))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assemble automatic NAND installer card
+        id: final-image
+        shell: bash
+        env:
+          PROFILE: ${{ steps.config.outputs.profile }}
+          ACCEPTED_IMAGE: ${{ steps.acceptance.outputs.raw_image }}
+          PAYLOAD_DIR: ${{ steps.nand-payload.outputs.payload_dir }}
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          final_image="$ACCEPTED_IMAGE"
+
+          if [[ "$PROFILE" == nand-installer ]]; then
+            sudo apt-get install -y --no-install-recommends \
+              cpio dosfstools python3 u-boot-tools
+            accepted_name=$(basename "$ACCEPTED_IMAGE")
+            final_image="$GITHUB_WORKSPACE/${accepted_name%.img}-autoinstall.img"
+            sudo env GITHUB_SHA="$GITHUB_SHA" \
+              bash scripts/assemble-pcduino3b-autoinstall-card.sh \
+                "$ACCEPTED_IMAGE" "$PAYLOAD_DIR" "$final_image"
+            sudo chown "$USER:$USER" "$final_image"
+          fi
+
+          final_image=$(readlink -f "$final_image")
+          final_bytes=$(stat -c %s "$final_image")
+          final_sha256=$(sha256sum "$final_image" | awk '{print $1}')
+          {
+            echo "raw_image=$final_image"
+            echo "raw_bytes=$final_bytes"
+            echo "raw_sha256=$final_sha256"
+            echo "seconds=$(( $(date +%s) - started ))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compress final image and test stream
+        id: compression
+        shell: bash
+        env:
+          RAW_IMAGE: ${{ steps.final-image.outputs.raw_image }}
           MODE: ${{ steps.config.outputs.compression }}
         run: |
           set -euo pipefail
@@ -562,7 +1293,7 @@ jobs:
             sha256sum -b "$(basename "$compressed_image")" \
               > "$(basename "$compressed_image").sha"
           )
-          ratio=$(awk -v raw='${{ steps.acceptance.outputs.raw_bytes }}' -v compressed="$compressed_bytes" \
+          ratio=$(awk -v raw='${{ steps.final-image.outputs.raw_bytes }}' -v compressed="$compressed_bytes" \
             'BEGIN { printf "%.1f", compressed * 100 / raw }')
 
           {
@@ -589,16 +1320,39 @@ jobs:
             echo "REPOSITORY_COMMIT=$GITHUB_SHA"
             echo "ARMBIAN_BUILD_REF=$ARMBIAN_BUILD_REF"
             echo "ARMBIAN_OS_REF=$ARMBIAN_OS_REF"
+            echo "KERNEL_GIT_REF=$KERNEL_GIT_REF"
             echo "PROFILE=${{ steps.config.outputs.profile }}"
             echo "IMAGE=$(basename '${{ steps.compression.outputs.image }}')"
             echo "IMAGE_SHA256=${{ steps.compression.outputs.sha256 }}"
-            echo "RAW_SHA256=${{ steps.acceptance.outputs.raw_sha256 }}"
+            echo "RAW_SHA256=${{ steps.final-image.outputs.raw_sha256 }}"
             echo 'BOARD=pcduino3b'
             echo 'BOARD_NAME=pcDuino3B'
             echo "DTB=$(basename '${{ steps.config.outputs.boot_fdt_file }}')"
             echo 'DT_MODEL=LinkSprite pcDuino3B'
             echo 'DT_PHY_MODE=rgmii-id'
+            echo 'WIFI_DRIVERS=rtl8192cu,rtl8xxxu'
+            echo 'WIFI_FIRMWARE=rtl8192cufw,rtl8188eufw'
+            echo 'WIFI_HARDWARE_SCAN=PENDING'
             echo 'NAND_CONTROLLER_STATUS=${{ steps.config.outputs.nand_controller_status }}'
+            echo 'NAND_OVERLAY=${{ steps.config.outputs.nand_overlay }}'
+            if [[ '${{ steps.config.outputs.profile }}' == nand-installer ]]; then
+              echo 'NAND_INSTALL_MODE=automatic-sd-card'
+              echo 'NAND_INSTALL_LOG_VOLUME=PCD3BINS'
+              echo 'SD_UBOOT_NAND_PROBE=disabled'
+              echo 'NAND_TARGET_UBOOT=separate-target'
+              echo 'NAND_PAYLOAD=PASS'
+              echo 'NAND_LAYOUT_VERSION=2'
+              echo 'NAND_BOOTFIT_OFFSET=0x02000000'
+              echo 'NAND_BOOTFIT_READ_BYTES=67108864'
+              echo 'NAND_BOOTFIT_SHA256=${{ steps.nand-payload.outputs.bootfit_sha256 }}'
+              echo 'NAND_BOOTFIT_BYTES=${{ steps.nand-payload.outputs.bootfit_bytes }}'
+              echo 'NAND_ROOTFS_PHYSICAL_OFFSET=0x08000000'
+              echo 'NAND_ROOTFS_SLC_EMULATION=dist6'
+              echo 'NAND_UBI_VOLUME=rootfs'
+              echo 'NAND_ROOTFS_UBI_SHA256=${{ steps.nand-payload.outputs.rootfs_ubi_sha256 }}'
+              echo 'NAND_ROOTFS_UBI_BYTES=${{ steps.nand-payload.outputs.rootfs_ubi_bytes }}'
+              echo 'NAND_BUNDLE_SHA256=${{ steps.nand-payload.outputs.bundle_sha256 }}'
+            fi
             echo 'USERSPACE=Ubuntu Noble armhf'
             echo 'HARDWARE_TEST_COMMAND=sudo pcduino3b-selftest'
           } | tee "$report"
@@ -613,6 +1367,9 @@ jobs:
           CANDIDATE_TAG: ${{ steps.config.outputs.candidate_tag }}
           IMAGE: ${{ steps.compression.outputs.image }}
           SHA_FILE: ${{ steps.compression.outputs.sha_file }}
+          PROFILE: ${{ steps.config.outputs.profile }}
+          NAND_BUNDLE: ${{ steps.nand-payload.outputs.bundle }}
+          NAND_SHA_FILE: ${{ steps.nand-payload.outputs.sha_file }}
         run: |
           set -uo pipefail
           if [[ "$PUBLISH" != true ]]; then
@@ -627,6 +1384,9 @@ jobs:
             echo "pcDuino3B ${{ steps.config.outputs.profile }} candidate from workflow run $GITHUB_RUN_ID."
             echo
             echo 'This prerelease passed image acceptance. Hardware acceptance is still pending.'
+            if [[ "$PROFILE" == nand-installer ]]; then
+              echo 'This image is a self-contained installer card: write it to SD, boot once, wait for automatic poweroff, remove SD, then boot NAND.'
+            fi
             echo 'Promote this exact byte stream with the release-promotion workflow after testing its SHA-256 on a physical pcDuino3B.'
           } > "$notes"
 
@@ -641,12 +1401,23 @@ jobs:
               || status=FAIL
           fi
           if [[ "$status" == PASS ]]; then
-            gh release upload "$CANDIDATE_TAG" "$IMAGE" "$SHA_FILE" \
+            assets=("$IMAGE" "$SHA_FILE")
+            if [[ "$PROFILE" == nand-installer ]]; then
+              [[ -s "$NAND_BUNDLE" && -s "$NAND_SHA_FILE" ]] || {
+                echo 'NAND installer bundle is missing' >&2
+                status=FAIL
+              }
+              assets+=("$NAND_BUNDLE" "$NAND_SHA_FILE")
+            fi
+          fi
+          if [[ "$status" == PASS ]]; then
+            gh release upload "$CANDIDATE_TAG" "${assets[@]}" \
               -R "$GITHUB_REPOSITORY" --clobber \
               || status=FAIL
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          [[ "$status" == PASS ]] || exit 1
 
       - name: Finalize candidate verification report
         shell: bash
@@ -704,6 +1475,8 @@ jobs:
             echo "| Image assembly (logged sections) | $assembly_seconds |"
             echo "| Full Armbian command(s) | ${BUILD_SECONDS:-0} |"
             echo "| Image acceptance | ${{ steps.acceptance.outputs.seconds || '0' }} |"
+            echo "| NAND payload assembly | ${{ steps.nand-payload.outputs.seconds || '0' }} |"
+            echo "| Automatic installer-card assembly | ${{ steps.final-image.outputs.seconds || '0' }} |"
             echo "| Compression | ${{ steps.compression.outputs.seconds || '0' }} |"
             echo "| Compression stream test | ${{ steps.compression.outputs.integrity_seconds || '0' }} |"
             echo "| Candidate image/checksum upload | ${{ steps.prerelease.outputs.seconds || '0' }} |"
@@ -715,7 +1488,7 @@ jobs:
             echo "| ccache | ${{ steps.ccache.outputs.cache-hit || 'false' }} | $CCACHE_RESTORED_BYTES |"
             echo "| Rootfs | ${{ steps.rootfs-cache.outputs.cache-hit || 'false' }} | $ROOTFS_CACHE_RESTORED_BYTES |"
             echo
-            echo "Raw image bytes: ${{ steps.acceptance.outputs.raw_bytes || 'unknown' }}"
+            echo "Raw image bytes: ${{ steps.final-image.outputs.raw_bytes || 'unknown' }}"
             echo
             echo "Compressed image bytes: ${{ steps.compression.outputs.bytes || 'unknown' }}"
             echo
@@ -746,6 +1519,7 @@ jobs:
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          [[ "$status" == PASS ]] || exit 1
 
       - name: Upload accepted workflow artifact
         id: workflow-artifact
@@ -756,34 +1530,13 @@ jobs:
           path: |
             ${{ steps.compression.outputs.image }}
             ${{ steps.compression.outputs.sha_file }}
+            ${{ steps.nand-payload.outputs.bundle }}
+            ${{ steps.nand-payload.outputs.sha_file }}
             ${{ steps.report.outputs.path }}
             ${{ steps.performance.outputs.path }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
-
-      - name: Save compiled artifact cache
-        if: steps.acceptance.outcome == 'success' && steps.compression.outcome == 'success'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            build/output/packages-hashed
-            build/output/debs
-          key: ${{ steps.config.outputs.artifact_cache_key }}
-
-      - name: Save compiler cache
-        if: steps.acceptance.outcome == 'success' && steps.compression.outcome == 'success'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: build/cache/ccache
-          key: ${{ steps.config.outputs.ccache_key }}
-
-      - name: Save rootfs cache
-        if: steps.acceptance.outcome == 'success' && steps.compression.outcome == 'success'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: build/cache/rootfs
-          key: ${{ steps.config.outputs.rootfs_key }}
 
       - name: Final runner capacity
         if: always()
@@ -823,10 +1576,11 @@ jobs:
             echo "- Artifact cache exact hit: \`${{ steps.artifact-cache.outputs.cache-hit || 'false' }}\`"
             echo "- ccache exact hit: \`${{ steps.ccache.outputs.cache-hit || 'false' }}\`"
             echo "- rootfs cache exact hit: \`${{ steps.rootfs-cache.outputs.cache-hit || 'false' }}\`"
-            echo "- Raw bytes: \`${{ steps.acceptance.outputs.raw_bytes || 'unavailable' }}\`"
+            echo "- Raw bytes: \`${{ steps.final-image.outputs.raw_bytes || 'unavailable' }}\`"
             echo "- Compressed bytes: \`${{ steps.compression.outputs.bytes || 'unavailable' }}\`"
             echo "- Compression ratio: \`${{ steps.compression.outputs.ratio || 'unavailable' }}%\`"
             echo "- Candidate SHA-256: \`${{ steps.compression.outputs.sha256 || 'unavailable' }}\`"
+            echo "- NAND bundle SHA-256: \`${{ steps.nand-payload.outputs.bundle_sha256 || 'not-applicable' }}\`"
             echo "- Candidate tag: \`${{ steps.config.outputs.candidate_tag || 'not-published' }}\`"
             echo
             echo 'Promotion is a separate workflow and never rebuilds or recompresses the candidate.'

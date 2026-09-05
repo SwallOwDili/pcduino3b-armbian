@@ -3,4 +3,6 @@ ca-certificates
 curl
 dnsutils
 ethtool
+iw
 openssh-server
+usbutils

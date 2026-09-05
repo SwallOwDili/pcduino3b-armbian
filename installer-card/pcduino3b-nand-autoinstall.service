@@ -1,0 +1,15 @@
+[Unit]
+Description=pcDuino3B one-shot NAND installer card
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+ConditionPathExists=/etc/pcduino3b-build-info
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcduino3b-nand-autoinstall
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

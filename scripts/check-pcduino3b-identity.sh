@@ -38,12 +38,26 @@ PATCH_FILE="userpatches/kernel/archive/sunxi-6.18/0001-arm-dts-sun7i-a20-pcduino
 SELFTEST="userpatches/overlay/usr/local/sbin/pcduino3b-selftest"
 NAND_PROBE="userpatches/overlay/usr/local/sbin/pcduino3b-nand-probe"
 NAND_OVERLAY="userpatches/dts/sun7i-a20-pcduino3b-nand-recovery.dtso"
+NAND_LAYOUT_OVERLAY="userpatches/dts/sun7i-a20-pcduino3b-nand-layout.dtso"
+IMAGE_WORKFLOW=".github/workflows/image-build.yml"
+UBOOT_PATCH="userpatches/u-boot/v2026.07-sunxi/board_pcduino3b/0001-pcduino3b-enable-onboard-nand.patch"
+AUTOINSTALL_RUNNER="installer-card/pcduino3b-nand-autoinstall"
+AUTOINSTALL_SERVICE="installer-card/pcduino3b-nand-autoinstall.service"
+AUTOINSTALL_ASSEMBLER="scripts/assemble-pcduino3b-autoinstall-card.sh"
 
 require_match '^BOARD_NAME="pcDuino3B"$' "$BOARD_FILE" 'BOARD_NAME must be pcDuino3B'
 require_match '^BOARDFAMILY="sun7i"$' "$BOARD_FILE" 'BOARDFAMILY must remain sun7i'
 require_match '^BOOTCONFIG="Linksprite_pcDuino3_defconfig"$' "$BOARD_FILE" 'expected U-Boot compatibility defconfig is missing'
 require_match '^BOOT_FDT_FILE="allwinner/sun7i-a20-pcduino3b\.dtb"$' "$BOARD_FILE" 'board must select the dedicated pcDuino3B DTB'
 require_match '^KERNEL_TARGET="current,edge,legacy"$' "$BOARD_FILE" 'board must expose current, edge and legacy kernel targets'
+require_match 'CONFIG_DEFAULT_DEVICE_TREE "sun7i-a20-pcduino3b"' "$BOARD_FILE" 'U-Boot must select the dedicated pcDuino3B control DT'
+require_match 'CONFIG_OF_LIST "sun7i-a20-pcduino3b"' "$BOARD_FILE" 'U-Boot OF list must use the dedicated pcDuino3B control DT'
+require_match 'nand-installer:2 \| nand-recovery:2' "$BOARD_FILE" \
+	'NAND-capable U-Boot must be isolated to target 2'
+require_match 'CONFIG_SYS_NAND_PAGE_SIZE "0x2000"' "$BOARD_FILE" \
+	'NAND U-Boot must use the verified 8192-byte page size'
+require_match 'CONFIG_SYS_NAND_OOBSIZE "0x280"' "$BOARD_FILE" \
+	'NAND U-Boot must use the verified 640-byte OOB size'
 
 require_match '\$BOARD" != "pcduino3b"' "$CUSTOMIZE" 'customize-image must reject targets other than pcduino3b'
 require_match '^ARMBIAN_BOARD=pcduino3b$' "$CUSTOMIZE" 'build-info must use the pcduino3b slug'
@@ -83,8 +97,34 @@ require_match 'BOARD is pcduino3b' "$SELFTEST" 'selftest must validate Armbian B
 require_match 'ARMBIAN_BOARD is pcduino3b' "$SELFTEST" 'selftest must validate build-info identity'
 require_match 'RTL8211E PHY is bound' "$SELFTEST" 'selftest must accept the verified RTL8211E identity'
 require_match 'detect_ethernet_interface' "$SELFTEST" 'selftest must discover the routed Ethernet interface'
-require_match 'sun7i-a20-pcduino3b-nand-recovery\.dtb' 'userpatches/extensions/pcduino3b-gigabit.sh' \
-	'NAND profiles must select the isolated recovery DTB'
+require_match 'BOOT_FDT_FILE="allwinner/sun7i-a20-pcduino3b\.dtb"' \
+	'userpatches/extensions/pcduino3b-gigabit.sh' \
+	'NAND profiles must retain the hardware-accepted base DTB'
+require_match 'nand_overlay=pcduino3b-nand-recovery' "$IMAGE_WORKFLOW" \
+	'NAND recovery profile must select its runtime overlay'
+require_match 'nand_overlay=pcduino3b-nand-layout' "$IMAGE_WORKFLOW" \
+	'NAND installer profile must select the fixed layout overlay'
+require_match 'Compile NAND overlay before Armbian cleanup' "$IMAGE_WORKFLOW" \
+	'NAND overlay must be preserved before Armbian removes its source'
+require_match 'overlay_source="\$GITHUB_WORKSPACE/userpatches/dts/sun7i-a20-\$\{OVERLAY_NAME\}[.]dtso"' "$IMAGE_WORKFLOW" \
+	'NAND overlay precompile must map the runtime name to the checked-in sun7i source'
+require_match 'overlay="\$OVERLAY_BLOB"' "$IMAGE_WORKFLOW" \
+	'NAND overlay injection must use the blob preserved before image assembly'
+
+require_match '^Subject: \[PATCH\] sunxi: pcduino3b:' "$UBOOT_PATCH" \
+	'U-Boot patch subject must identify pcDuino3B'
+require_match 'arch/arm/dts/sun7i-a20-pcduino3b\.dts' "$UBOOT_PATCH" \
+	'U-Boot patch must add a dedicated pcDuino3B control DT'
+require_match 'model = "LinkSprite pcDuino3B";' "$UBOOT_PATCH" \
+	'U-Boot control DT model must identify pcDuino3B'
+require_match 'pcduino3b_nand_pins: nand-pins' "$UBOOT_PATCH" \
+	'U-Boot NAND labels must use the pcduino3b prefix'
+if grep -Fq 'diff --git a/arch/arm/dts/sun7i-a20-pcduino3.dts' "$UBOOT_PATCH"; then
+	fail 'U-Boot patch must not modify the upstream pcDuino3 control DT'
+fi
+if grep -Eq '^\+[[:space:]]*pcduino3_nand_' "$UBOOT_PATCH"; then
+	fail 'U-Boot patch introduced a non-3B NAND symbol'
+fi
 
 forbid_match 'armbian_board:.*pcduino3([^b[:alnum:]_]|$)' \
 	'workflow still builds the legacy board slug' .github/workflows
@@ -126,6 +166,33 @@ require_match 'nand-ecc-mode = "hw";' "$NAND_OVERLAY" \
 if grep -Eq '^[[:space:]]*(nand-on-flash-bbt|partitions)[[:space:]{;]' "$NAND_OVERLAY"; then
 	fail 'fast repack overlay must not declare persistent BBT or a partition map'
 fi
+for label in spl-primary spl-backup uboot bootfit rootfs; do
+	require_match "label = \"$label\";" "$NAND_LAYOUT_OVERLAY" \
+		"installer layout overlay is missing $label"
+done
+require_match 'reg = <0x02000000 0x06000000>;' "$NAND_LAYOUT_OVERLAY" \
+	'installer layout overlay has the wrong raw boot FIT region'
+require_match 'reg = <0x08000000 0xf8000000>;' "$NAND_LAYOUT_OVERLAY" \
+	'installer layout overlay has the wrong SLC rootfs region'
+require_match 'slc-mode;' "$NAND_LAYOUT_OVERLAY" \
+	'installer layout overlay must enable paired-page SLC emulation'
+
+require_match '^readonly CARD_LABEL=PCD3BINS$' "$AUTOINSTALL_RUNNER" \
+	'automatic installer must use the dedicated payload/log volume'
+require_match 'payload partition is not on the boot microSD' "$AUTOINSTALL_RUNNER" \
+	'automatic installer must bind its payload to the boot card'
+require_match '^modprobe sunxi_nand$' "$AUTOINSTALL_RUNNER" \
+	'automatic installer must defer NAND probing until userspace'
+require_match 'AUTOINSTALL_STATUS=PASS' "$AUTOINSTALL_RUNNER" \
+	'automatic installer must expose an explicit success result'
+require_match '^ExecStart=/usr/local/sbin/pcduino3b-nand-autoinstall$' \
+	"$AUTOINSTALL_SERVICE" 'automatic installer service entrypoint is missing'
+require_match 'mkfs[.]vfat -F 32 -n PCD3BINS' "$AUTOINSTALL_ASSEMBLER" \
+	'automatic installer image must include the FAT payload/log volume'
+require_match 'modprobe[.]blacklist=sunxi_nand' "$AUTOINSTALL_ASSEMBLER" \
+	'installer SD must suppress early NAND probing'
+require_match 'NAND_INSTALL_MODE=automatic-sd-card' "$IMAGE_WORKFLOW" \
+	'workflow report must identify the autonomous installer-card mode'
 
 if ((FAILURES > 0)); then
 	printf 'identity lint: %d failure(s)\n' "$FAILURES" >&2

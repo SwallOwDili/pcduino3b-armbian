@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
+/*
+ * Writable NAND layout for the pcDuino3B installer and NAND rootfs.
+ * The rootfs partition uses the chip's paired-page-safe SLC emulation.
+ * Recovery uses pcduino3b-nand-recovery.dtso instead and exposes no partitions.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc/pinctrl@1c20800";
+
+		__overlay__ {
+			pcduino3b_nand_pins: nand-pins {
+				pins = "PC0", "PC1", "PC2", "PC5", "PC8", "PC9",
+				       "PC10", "PC11", "PC12", "PC13", "PC14",
+				       "PC15", "PC16";
+				function = "nand0";
+			};
+
+			pcduino3b_nand_cs0_pin: nand-cs0-pin {
+				pins = "PC4";
+				function = "nand0";
+			};
+
+			pcduino3b_nand_rb0_pin: nand-rb0-pin {
+				pins = "PC6";
+				function = "nand0";
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc/nand-controller@1c03000";
+
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&pcduino3b_nand_pins>, <&pcduino3b_nand_cs0_pin>,
+				    <&pcduino3b_nand_rb0_pin>;
+			status = "okay";
+
+			nand@0 {
+				reg = <0>;
+				allwinner,rb = <0>;
+				nand-ecc-mode = "hw";
+
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					partition@0 {
+						label = "spl-primary";
+						reg = <0x00000000 0x00400000>;
+					};
+
+					partition@400000 {
+						label = "spl-backup";
+						reg = <0x00400000 0x00400000>;
+					};
+
+					partition@800000 {
+						label = "uboot";
+						reg = <0x00800000 0x01800000>;
+					};
+
+					partition@2000000 {
+						label = "bootfit";
+						reg = <0x02000000 0x06000000>;
+					};
+
+					partition@8000000 {
+						label = "rootfs";
+						reg = <0x08000000 0xf8000000>;
+						slc-mode;
+					};
+				};
+			};
+		};
+	};
+};

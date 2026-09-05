@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# pcDuino3B Gigabit Ethernet kernel guarantees.
+# pcDuino3B Ethernet and onboard USB Wi-Fi kernel guarantees.
 # Keep this file function-only: Armbian sources extension files into its build shell.
 
 function extension_prepare_config__pcduino3b_profile_suffix() {
@@ -14,9 +14,24 @@ function extension_prepare_config__pcduino3b_profile_suffix() {
 function extension_prepare_config__pcduino3b_profile_dtb() {
 	case "${PCDUINO3B_IMAGE_PROFILE:-}" in
 		nand-installer | nand-recovery)
-			# NAND experiments boot a dedicated DTB.  The normal SD DTB keeps
-			# the controller disabled and is never modified at runtime.
-			BOOT_FDT_FILE="allwinner/sun7i-a20-pcduino3b-nand-recovery.dtb"
+			# Keep the hardware-accepted base DTB on disk.  CI installs a
+			# profile-specific overlay which U-Boot applies in memory; this is
+			# the same path that remained network-stable on the physical board.
+			BOOT_FDT_FILE="allwinner/sun7i-a20-pcduino3b.dtb"
+			;;
+	esac
+}
+
+function extension_prepare_config__pcduino3b_nand_uboot_artifacts() {
+	case "${PCDUINO3B_IMAGE_PROFILE:-}" in
+		nand-installer | nand-recovery)
+			# Build two independent configurations. Target 1 is deliberately
+			# MMC-only and is written to the installer SD. Target 2 enables raw
+			# NAND and supplies the SPL/U-Boot payload installed onto the board.
+			# Sharing one NAND-enabled binary between both roles previously made
+			# the recovery SD hang during U-Boot's early NAND initialization.
+			UBOOT_TARGET_MAP=';;u-boot-sunxi-with-spl.bin
+;;spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
 			;;
 	esac
 }
@@ -36,6 +51,15 @@ function custom_kernel_config__pcduino3b_gigabit_ethernet() {
 		"CONFIG_STMMAC_PLATFORM=y"
 		"CONFIG_DWMAC_SUNXI=y"
 		"CONFIG_REALTEK_PHY=y"
+		"CONFIG_CFG80211=m"
+		"CONFIG_MAC80211=m"
+		"CONFIG_RTL8192CU=m"
+		"CONFIG_RTL8XXXU=m"
+		"CONFIG_USB=y"
+		"CONFIG_USB_EHCI_HCD=y"
+		"CONFIG_USB_EHCI_HCD_PLATFORM=y"
+		"CONFIG_USB_OHCI_HCD=y"
+		"CONFIG_USB_OHCI_HCD_PLATFORM=y"
 	)
 
 	# Armbian can call this hook before a kernel .config exists.
@@ -47,5 +71,19 @@ function custom_kernel_config__pcduino3b_gigabit_ethernet() {
 		CONFIG_STMMAC_PLATFORM
 		CONFIG_DWMAC_SUNXI
 		CONFIG_REALTEK_PHY
+		CONFIG_USB
+		CONFIG_USB_EHCI_HCD
+		CONFIG_USB_EHCI_HCD_PLATFORM
+		CONFIG_USB_OHCI_HCD
+		CONFIG_USB_OHCI_HCD_PLATFORM
+	)
+
+	# The physical target reports USB ID 0bda:8179 and is verified with the
+	# in-tree rtl8xxxu driver.  Keep rtl8192cu too for 0bda:8176 board variants.
+	opts_m+=(
+		CONFIG_CFG80211
+		CONFIG_MAC80211
+		CONFIG_RTL8192CU
+		CONFIG_RTL8XXXU
 	)
 }

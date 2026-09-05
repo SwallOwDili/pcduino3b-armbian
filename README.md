@@ -10,7 +10,7 @@
 
 候选镜像先作为 pre-release 上传；实体板验证的必须是该候选文件本身及其 SHA-256。正式发布只提升同一候选 Release，不重新构建或压缩。
 
-## 独立板型与千兆网适配
+## 独立板型、千兆网与板载 Wi-Fi
 
 本项目通过 `userpatches/config/boards/pcduino3b.csc` 注册独立板型，并生成、加载 `sun7i-a20-pcduino3b.dtb`。原版板型的设备树保持不变。
 
@@ -29,7 +29,9 @@ pcDuino3B 专用设备树以其上游 A20 板级定义为兼容基础，只表�
 
 内核配置保证 `STMMAC_ETH`、`STMMAC_PLATFORM`、`DWMAC_SUNXI` 和 `REALTEK_PHY` 可用。实体板基线为 `end0`、`st_gmac`、RTL8211E、1000Mb/s Full Duplex。
 
-`Linksprite_pcDuino3_defconfig`、`sun7i-a20-pcduino3.dts` 和 `linksprite,pcduino3` 仅作为 U-Boot、Linux 设备树的底层兼容实现；它们不得成为镜像 hostname、Armbian `BOARD`、DT model、镜像名或 Release 产品名。
+板载 2.4 GHz 802.11b/g/n Wi-Fi 走 A20 内部 USB。构建同时保证 `RTL8192CU`（RTL8188CUS，常见 USB ID `0bda:8176`）和 `RTL8XXXU`（RTL8188EUS，常见 USB ID `0bda:8179`）可用，并在镜像验收时检查两套模块、`armbian-firmware` 中的全部对应固件、`iw`、`wpa_supplicant`、regulatory database 和 NetworkManager。所有 profile 默认使用 NetworkManager，避免 Minimal recovery 镜像只能通过手工网络配置启用 Wi-Fi。当前实体板已确认 USB ID 为 `0bda:8179`，绑定内核自带的 `rtl8xxxu`，并成功扫描到无线网络。
+
+`Linksprite_pcDuino3_defconfig`、`sun7i-a20-pcduino3.dts` 和 `linksprite,pcduino3` 仅作为 U-Boot、Linux 设备树的底层兼容实现；U-Boot 与 Linux 均由各自独立的 `sun7i-a20-pcduino3b.dts` 覆盖板级差异，它们不得成为镜像 hostname、Armbian `BOARD`、DT model、镜像名或 Release 产品名。
 
 ## 构建层次
 
@@ -45,18 +47,20 @@ pcDuino3B 专用设备树以其上游 A20 板级定义为兼容基础，只表�
 | --- | --- | --- |
 | `dev` | 快速网络、身份和板级验证 | Minimal；快速产物；不创建正式 Release |
 | `sd-release` | 日常 microSD 系统 | 完整验收；xz；SHA-256 |
-| `nand-installer` | 4GiB NAND 安装研究入口 | Minimal；选择隔离 recovery DTB，当前仍只有只读诊断 |
-| `nand-recovery` | NAND 备份、恢复研究入口 | Minimal；选择隔离 recovery DTB，不具备写入授权 |
+| `nand-installer` | 4GiB NAND 自动安装卡 | Minimal；写卡后开机自动烧录 NAND、校验、记录日志并关机；不需要 SSH 或手动命令 |
+| `nand-recovery` | NAND 备份、恢复入口 | Minimal；基准 DTB + 无分区 recovery overlay；默认只读探测 |
 
-NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`pcduino3b-nand-rootfs` 和 `pcduino3b-nand-layout`。NAND 实验不进入普通 `sd-release` 镜像路径。
+NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`pcduino3b-nand-rootfs`、`pcduino3b-nand-layout` 和 `pcduino3b-nand-boot.itb`。NAND 实验不进入普通 `sd-release` 镜像路径。
 
 2026-09-04 正式 SD 镜像已在实体板通过 23 项自检：从 `/dev/mmcblk0p1` 启动，独立 DTB、身份、RTL8211E 千兆、DNS/APT、USB、I2C、SATA、SSH 和 NTP 均通过。普通 `sun7i-a20-pcduino3b.dtb` 继续把 NFC 设为 `disabled`。
 
-旧测试镜像的只读证据表明：NFC/NAND 节点设为 `okay` 后，内核能识别 Hynix `0xad:0xd7`、4 GiB、4 KiB page、128 B OOB，但 ONFI 参数恢复失败，`sunxi_nand` 以 `-22` 退出。隔离的 `sun7i-a20-pcduino3b-nand-recovery.dtb` 只为 NAND profile 启用 CS0/RB0 和硬件 ECC；它不声明分区，也不启用可能创建持久化表的 `nand-on-flash-bbt`。`sudo pcduino3b-nand-probe` 只采集现状；在 ECC、坏块和完整备份得到验证前，输出保持 `INSTALLER=NOT_AUTHORIZED`。
+实体板已读出完整 NAND ID `ad d7 94 91 60 44`，确认芯片为 Hynix `H27UBG8T2C`。原来的 4 KiB page / 128 B OOB 是通用 Hynix fallback 在 ONFI 参数页不可恢复时产生的错误解码；精确 ID 表修正后，Linux 实机成功枚举 `/dev/mtd0`，正确几何为 4 GiB、8 KiB page、640 B OOB、2 MiB eraseblock、40-bit/1 KiB ECC。隔离的 `sun7i-a20-pcduino3b-nand-recovery.dtb` 仍不声明分区，也不启用持久化 BBT。
 
 需要快速生成探测卡时，`pcDuino3B fast NAND recovery repack` 工作流直接复用已经实机验收的正式 SD 镜像，保留原始普通 DTB，并让 U-Boot 在内存中应用经过预检的 NAND recovery overlay。2026-09-04 实机验证表明，主机构建工具预合成的 recovery DTB 无法正常启动，而“普通 DTB + U-Boot overlay”可正常进入 SSH。恢复镜像会禁止 `sunxi_nand` 在启动期间被 udev 自动加载；登录后再显式执行 `sudo modprobe sunxi_nand`。它不调用 Armbian 内核构建、不替换内核，也不改变普通 SD Release；输出仍作为独立的 NAND recovery 候选发布。
 
-同日实机复测确认 runtime overlay 已进入 live DT，网卡保持 `LOWER_UP`。显式加载 `sunxi_nand` 不会使系统掉线，但探测仍因 ONFI 参数页恢复失败返回 `-22`，`/proc/mtd` 继续为空；因此当前进展是“安全复现并定位初始化失败”，不是 NAND 可安装状态。
+同日只读扫描确认 4 个已有坏块，位置为 `0xfe400000`、`0xfe600000`、`0xffc00000`、`0xffe00000`；除前约 28 MiB 的旧引导数据外，其余区域基本为空。已完成包含 OOB 的全盘原始备份，大小 `4,630,511,616` 字节，SHA-256 为 `42e946fff07ebbc0f1a3c4e84c14e99fd57566624b42042edc826c03efeab1d3`，并在独立主机副本上复核一致。
+
+NAND installer 使用版本 2 布局：ECC 编码 SPL 主/备份分别位于 0 和 4 MiB，U-Boot proper 位于 8 MiB，32–128 MiB 是 U-Boot 可直接读取的 raw boot FIT，128 MiB 之后由 Linux 以 paired-page `slc-mode` 暴露为约 1984 MiB 逻辑 UBI `rootfs`。这是因为 Hynix MLC 原始分区会被 UBI 明确拒绝，而 U-Boot 又不能解释 Linux 的 SLC-on-MLC 映射。构建分别生成安装卡自身使用的 MMC-only U-Boot 和写入 NAND 的 NAND U-Boot；前者不探测 NAND，后者使用实测的 8 KiB page、640 B OOB。最终候选是自包含的自动安装 SD 镜像：开机后在 userspace 显式加载 `sunxi_nand`，完成全部写入和回读，再把状态、内核日志及 journal 写到可由普通电脑读取的 `PCD3BINS` FAT 分区并自动关机。用户不需要 SSH、上传 bundle 或手动运行安装器。代码、静态测试和整卡离线装配测试已通过，但在同一 CI 候选尚未完成实体板写入/拔卡启动测试前，仍不宣称已经可从 NAND 启动。
 
 ## 板端验收
 
@@ -64,13 +68,15 @@ NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`p
 sudo pcduino3b-selftest
 ```
 
-自检自动选择默认路由对应的有线接口（实机为 `end0`），检查四处身份、live DT、RTL8211E/Realtek PHY 绑定、千兆全双工、DNS、Ubuntu Noble HTTPS、APT、SATA、USB、I2C、SSH 和 NTP。核心结果应包括：
+自检自动选择默认路由对应的有线接口（实机为 `end0`），检查四处身份、live DT、RTL8211E/Realtek PHY 绑定、千兆全双工、板载 Realtek Wi-Fi 驱动/固件/扫描、DNS、Ubuntu Noble HTTPS、APT、SATA、USB、I2C、SSH 和 NTP。核心结果应包括：
 
 ```text
 [PASS] device tree model identifies LinkSprite pcDuino3B
 [PASS] GMAC device tree uses rgmii-id
 [PASS] RTL8211E PHY is bound
 [PASS] Ethernet negotiated 1000Mb/s Full Duplex
+[PASS] onboard Realtek Wi-Fi is bound to rtl8xxxu
+[PASS] Wi-Fi scan completed
 ```
 
 ## 固定基线
