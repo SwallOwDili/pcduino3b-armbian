@@ -38,6 +38,7 @@ on:
     paths:
       - '.github/workflows/image-build.yml'
       - 'packages/**'
+      - 'installer-card/**'
       - 'scripts/**'
       - 'tests/**'
       - 'userpatches/**'
@@ -703,6 +704,44 @@ jobs:
                   -name pcduino3b-nand-u-boot.bin -print
               )
               [[ ${#nand_spl_files[@]} -eq 1 && ${#nand_uboot_files[@]} -eq 1 ]]
+              mapfile -t sd_uboot_files < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name u-boot-sunxi-with-spl.bin -print
+              )
+              mapfile -t sd_uboot_configs < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name u-boot-config-target-1 -print
+              )
+              mapfile -t nand_uboot_configs < <(
+                sudo find "$mount_dir/usr/lib" -type f \
+                  -name u-boot-config-target-2 -print
+              )
+              [[ ${#sd_uboot_files[@]} -eq 1 ]]
+              [[ ${#sd_uboot_configs[@]} -eq 1 && ${#nand_uboot_configs[@]} -eq 1 ]]
+
+              # The card itself must contain the MMC-only target at the exact
+              # sunxi boot offset.  The separately packaged target is the only
+              # one allowed to initialize NAND and is never written to the SD.
+              for option in \
+                CONFIG_MTD_RAW_NAND \
+                CONFIG_NAND_SUNXI \
+                CONFIG_CMD_NAND \
+                CONFIG_SPL_NAND_SUPPORT; do
+                sudo grep -Fxq "# $option is not set" "${sd_uboot_configs[0]}"
+              done
+              for option in \
+                CONFIG_MTD_RAW_NAND=y \
+                CONFIG_NAND_SUNXI=y \
+                CONFIG_CMD_NAND=y \
+                CONFIG_SPL_NAND_SUPPORT=y \
+                CONFIG_SYS_NAND_PAGE_SIZE=0x2000 \
+                CONFIG_SYS_NAND_OOBSIZE=0x280; do
+                sudo grep -Fxq "$option" "${nand_uboot_configs[0]}"
+              done
+              sd_uboot_bytes=$(sudo stat -c %s "${sd_uboot_files[0]}")
+              ((sd_uboot_bytes > 0 && sd_uboot_bytes < 1040384))
+              sudo cmp --bytes="$sd_uboot_bytes" --ignore-initial=8192:0 \
+                "$raw_image" "${sd_uboot_files[0]}"
               # 24 physical pages, each containing 8192 data + 640 OOB bytes.
               [[ "$(sudo stat -c %s "${nand_spl_files[0]}")" -eq 211968 ]]
               nand_uboot_bytes=$(sudo stat -c %s "${nand_uboot_files[0]}")
@@ -1138,14 +1177,48 @@ jobs:
             echo "rootfs_ubi_bytes=$rootfs_bytes"
             echo "bootfit_sha256=$(sha256sum "$boot_fit" | awk '{print $1}')"
             echo "bootfit_bytes=$bootfit_bytes"
+            echo "payload_dir=$payload_dir"
             echo "seconds=$(( $(date +%s) - started ))"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Compress accepted image and test stream
+      - name: Assemble automatic NAND installer card
+        id: final-image
+        shell: bash
+        env:
+          PROFILE: ${{ steps.config.outputs.profile }}
+          ACCEPTED_IMAGE: ${{ steps.acceptance.outputs.raw_image }}
+          PAYLOAD_DIR: ${{ steps.nand-payload.outputs.payload_dir }}
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          final_image="$ACCEPTED_IMAGE"
+
+          if [[ "$PROFILE" == nand-installer ]]; then
+            sudo apt-get install -y --no-install-recommends \
+              cpio dosfstools python3 u-boot-tools
+            accepted_name=$(basename "$ACCEPTED_IMAGE")
+            final_image="$GITHUB_WORKSPACE/${accepted_name%.img}-autoinstall.img"
+            sudo env GITHUB_SHA="$GITHUB_SHA" \
+              bash scripts/assemble-pcduino3b-autoinstall-card.sh \
+                "$ACCEPTED_IMAGE" "$PAYLOAD_DIR" "$final_image"
+            sudo chown "$USER:$USER" "$final_image"
+          fi
+
+          final_image=$(readlink -f "$final_image")
+          final_bytes=$(stat -c %s "$final_image")
+          final_sha256=$(sha256sum "$final_image" | awk '{print $1}')
+          {
+            echo "raw_image=$final_image"
+            echo "raw_bytes=$final_bytes"
+            echo "raw_sha256=$final_sha256"
+            echo "seconds=$(( $(date +%s) - started ))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compress final image and test stream
         id: compression
         shell: bash
         env:
-          RAW_IMAGE: ${{ steps.acceptance.outputs.raw_image }}
+          RAW_IMAGE: ${{ steps.final-image.outputs.raw_image }}
           MODE: ${{ steps.config.outputs.compression }}
         run: |
           set -euo pipefail
@@ -1180,7 +1253,7 @@ jobs:
             sha256sum -b "$(basename "$compressed_image")" \
               > "$(basename "$compressed_image").sha"
           )
-          ratio=$(awk -v raw='${{ steps.acceptance.outputs.raw_bytes }}' -v compressed="$compressed_bytes" \
+          ratio=$(awk -v raw='${{ steps.final-image.outputs.raw_bytes }}' -v compressed="$compressed_bytes" \
             'BEGIN { printf "%.1f", compressed * 100 / raw }')
 
           {
@@ -1211,7 +1284,7 @@ jobs:
             echo "PROFILE=${{ steps.config.outputs.profile }}"
             echo "IMAGE=$(basename '${{ steps.compression.outputs.image }}')"
             echo "IMAGE_SHA256=${{ steps.compression.outputs.sha256 }}"
-            echo "RAW_SHA256=${{ steps.acceptance.outputs.raw_sha256 }}"
+            echo "RAW_SHA256=${{ steps.final-image.outputs.raw_sha256 }}"
             echo 'BOARD=pcduino3b'
             echo 'BOARD_NAME=pcDuino3B'
             echo "DTB=$(basename '${{ steps.config.outputs.boot_fdt_file }}')"
@@ -1223,6 +1296,10 @@ jobs:
             echo 'NAND_CONTROLLER_STATUS=${{ steps.config.outputs.nand_controller_status }}'
             echo 'NAND_OVERLAY=${{ steps.config.outputs.nand_overlay }}'
             if [[ '${{ steps.config.outputs.profile }}' == nand-installer ]]; then
+              echo 'NAND_INSTALL_MODE=automatic-sd-card'
+              echo 'NAND_INSTALL_LOG_VOLUME=PCD3BINS'
+              echo 'SD_UBOOT_NAND_PROBE=disabled'
+              echo 'NAND_TARGET_UBOOT=separate-target'
               echo 'NAND_PAYLOAD=PASS'
               echo 'NAND_LAYOUT_VERSION=2'
               echo 'NAND_BOOTFIT_OFFSET=0x02000000'
@@ -1267,6 +1344,9 @@ jobs:
             echo "pcDuino3B ${{ steps.config.outputs.profile }} candidate from workflow run $GITHUB_RUN_ID."
             echo
             echo 'This prerelease passed image acceptance. Hardware acceptance is still pending.'
+            if [[ "$PROFILE" == nand-installer ]]; then
+              echo 'This image is a self-contained installer card: write it to SD, boot once, wait for automatic poweroff, remove SD, then boot NAND.'
+            fi
             echo 'Promote this exact byte stream with the release-promotion workflow after testing its SHA-256 on a physical pcDuino3B.'
           } > "$notes"
 
@@ -1356,6 +1436,7 @@ jobs:
             echo "| Full Armbian command(s) | ${BUILD_SECONDS:-0} |"
             echo "| Image acceptance | ${{ steps.acceptance.outputs.seconds || '0' }} |"
             echo "| NAND payload assembly | ${{ steps.nand-payload.outputs.seconds || '0' }} |"
+            echo "| Automatic installer-card assembly | ${{ steps.final-image.outputs.seconds || '0' }} |"
             echo "| Compression | ${{ steps.compression.outputs.seconds || '0' }} |"
             echo "| Compression stream test | ${{ steps.compression.outputs.integrity_seconds || '0' }} |"
             echo "| Candidate image/checksum upload | ${{ steps.prerelease.outputs.seconds || '0' }} |"
@@ -1367,7 +1448,7 @@ jobs:
             echo "| ccache | ${{ steps.ccache.outputs.cache-hit || 'false' }} | $CCACHE_RESTORED_BYTES |"
             echo "| Rootfs | ${{ steps.rootfs-cache.outputs.cache-hit || 'false' }} | $ROOTFS_CACHE_RESTORED_BYTES |"
             echo
-            echo "Raw image bytes: ${{ steps.acceptance.outputs.raw_bytes || 'unknown' }}"
+            echo "Raw image bytes: ${{ steps.final-image.outputs.raw_bytes || 'unknown' }}"
             echo
             echo "Compressed image bytes: ${{ steps.compression.outputs.bytes || 'unknown' }}"
             echo
@@ -1455,7 +1536,7 @@ jobs:
             echo "- Artifact cache exact hit: \`${{ steps.artifact-cache.outputs.cache-hit || 'false' }}\`"
             echo "- ccache exact hit: \`${{ steps.ccache.outputs.cache-hit || 'false' }}\`"
             echo "- rootfs cache exact hit: \`${{ steps.rootfs-cache.outputs.cache-hit || 'false' }}\`"
-            echo "- Raw bytes: \`${{ steps.acceptance.outputs.raw_bytes || 'unavailable' }}\`"
+            echo "- Raw bytes: \`${{ steps.final-image.outputs.raw_bytes || 'unavailable' }}\`"
             echo "- Compressed bytes: \`${{ steps.compression.outputs.bytes || 'unavailable' }}\`"
             echo "- Compression ratio: \`${{ steps.compression.outputs.ratio || 'unavailable' }}%\`"
             echo "- Candidate SHA-256: \`${{ steps.compression.outputs.sha256 || 'unavailable' }}\`"

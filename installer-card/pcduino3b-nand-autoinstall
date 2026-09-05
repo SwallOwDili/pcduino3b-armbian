@@ -1,0 +1,201 @@
+#!/bin/bash
+# One-shot pcDuino3B NAND installation launched by the dedicated SD card.
+
+set -euo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+readonly CARD_LABEL=PCD3BINS
+readonly CARD_MOUNT=/run/pcduino3b-installer-card
+readonly PAYLOAD_DIR=$CARD_MOUNT/payload
+readonly STATE_DIR=$CARD_MOUNT/state
+readonly LOG_DIR=$CARD_MOUNT/logs
+readonly SYSTEM_LAYOUT=/usr/share/pcduino3b/nand-layout.env
+
+LED_PATH=
+LOG_READY=no
+KERNEL_LOG_PID=
+
+stop_kernel_logger() {
+	[[ -n "$KERNEL_LOG_PID" ]] || return 0
+	kill "$KERNEL_LOG_PID" 2>/dev/null || true
+	wait "$KERNEL_LOG_PID" 2>/dev/null || true
+	KERNEL_LOG_PID=
+}
+
+find_status_led() {
+	local candidate
+	for candidate in /sys/class/leds/*:tx /sys/class/leds/*:usr2; do
+		[[ -d "$candidate" ]] || continue
+		LED_PATH=$candidate
+		return 0
+	done
+	return 1
+}
+
+set_led_timer() {
+	local delay_ms=$1
+	[[ -n "$LED_PATH" ]] || return 0
+	printf '%s\n' timer >"$LED_PATH/trigger" 2>/dev/null || return 0
+	printf '%s\n' "$delay_ms" >"$LED_PATH/delay_on" 2>/dev/null || true
+	printf '%s\n' "$delay_ms" >"$LED_PATH/delay_off" 2>/dev/null || true
+}
+
+set_led_off() {
+	[[ -n "$LED_PATH" ]] || return 0
+	printf '%s\n' none >"$LED_PATH/trigger" 2>/dev/null || true
+	printf '%s\n' 0 >"$LED_PATH/brightness" 2>/dev/null || true
+}
+
+record_failure() {
+	local status=$1
+	trap - EXIT
+	set +e
+	echo "AUTOINSTALL_STATUS=FAIL exit=$status"
+	stop_kernel_logger
+	set_led_timer 100
+	if [[ "$LOG_READY" == yes ]]; then
+		{
+			echo 'STATUS=FAIL'
+			echo "EXIT_STATUS=$status"
+			date -u '+FINISHED_UTC=%Y-%m-%dT%H:%M:%SZ'
+		} >"$STATE_DIR/FAILED.tmp"
+		mv -f "$STATE_DIR/FAILED.tmp" "$STATE_DIR/FAILED.txt"
+		sync
+	fi
+	exit "$status"
+}
+
+trap 'record_failure $?' EXIT
+
+[[ $EUID -eq 0 ]] || {
+	echo 'ERROR: automatic installer must run as root' >&2
+	exit 1
+}
+
+root_source=$(findmnt -n -o SOURCE /)
+[[ "$root_source" == /dev/mmcblk*p* ]] || {
+	echo "ERROR: installer root is not microSD: $root_source" >&2
+	exit 1
+}
+
+card_device=$(blkid -L "$CARD_LABEL" || true)
+[[ -b "$card_device" ]] || {
+	echo "ERROR: $CARD_LABEL payload partition was not found" >&2
+	exit 1
+}
+root_parent=$(lsblk -ndo PKNAME "$root_source")
+card_parent=$(lsblk -ndo PKNAME "$card_device")
+[[ -n "$root_parent" && "$card_parent" == "$root_parent" ]] || {
+	echo "ERROR: payload partition is not on the boot microSD" >&2
+	exit 1
+}
+
+install -d -m 0755 "$CARD_MOUNT"
+mount -t vfat -o rw,nosuid,nodev,noexec "$card_device" "$CARD_MOUNT"
+install -d -m 0755 "$STATE_DIR" "$LOG_DIR"
+LOG_READY=yes
+exec > >(tee -a "$LOG_DIR/install.log") 2>&1
+
+echo 'PCDUINO3B_NAND_AUTOINSTALL=START'
+date -u '+STARTED_UTC=%Y-%m-%dT%H:%M:%SZ'
+echo "SD_ROOT=$root_source"
+echo "PAYLOAD_PARTITION=$card_device"
+{
+	echo
+	echo '===== pcDuino3B installer boot ====='
+	date -u '+STARTED_UTC=%Y-%m-%dT%H:%M:%SZ'
+	cat /proc/cmdline
+	dmesg --color=never
+} >>"$LOG_DIR/kernel.log" 2>&1 || true
+journalctl --boot --no-pager --output=short-monotonic \
+	>"$LOG_DIR/journal-current-boot.log" 2>&1 || true
+stdbuf -oL dmesg --follow-new --color=never \
+	>>"$LOG_DIR/kernel.log" 2>&1 &
+KERNEL_LOG_PID=$!
+sync
+
+if [[ -f "$STATE_DIR/SUCCESS.txt" ]]; then
+	echo 'AUTOINSTALL_STATUS=ALREADY_COMPLETE'
+	echo 'Remove the installer SD card before the next power-on.'
+	stop_kernel_logger
+	sync
+	set_led_off
+	trap - EXIT
+	systemctl poweroff
+	exit 0
+fi
+if [[ -f "$STATE_DIR/IN_PROGRESS.txt" || -f "$STATE_DIR/FAILED.txt" ]]; then
+	echo 'ERROR: a previous attempt did not complete; refusing an automatic retry' >&2
+	echo 'Read logs/install.log from the SD card before rebuilding or retrying it.' >&2
+	exit 1
+fi
+
+[[ -r "$SYSTEM_LAYOUT" ]] || {
+	echo "ERROR: missing system NAND layout: $SYSTEM_LAYOUT" >&2
+	exit 1
+}
+[[ -r "$PAYLOAD_DIR/pcduino3b-nand-layout.env" ]] || {
+	echo 'ERROR: payload NAND layout is missing' >&2
+	exit 1
+}
+cmp -s "$SYSTEM_LAYOUT" "$PAYLOAD_DIR/pcduino3b-nand-layout.env" || {
+	echo 'ERROR: payload and installer NAND layouts differ' >&2
+	exit 1
+}
+
+# shellcheck disable=SC1090
+source "$SYSTEM_LAYOUT"
+[[ "$PCDUINO3B_NAND_ID" == add794916044 ]] || {
+	echo "ERROR: unexpected NAND identity guard: $PCDUINO3B_NAND_ID" >&2
+	exit 1
+}
+
+{
+	echo 'STATUS=IN_PROGRESS'
+	date -u '+STARTED_UTC=%Y-%m-%dT%H:%M:%SZ'
+	echo "NAND_ID=$PCDUINO3B_NAND_ID"
+	sha256sum "$PAYLOAD_DIR/SHA256SUMS"
+} >"$STATE_DIR/IN_PROGRESS.txt"
+sync
+
+find_status_led || true
+set_led_timer 1000
+
+echo 'PHASE=load-nand-driver'
+modprobe sunxi_nand
+for _ in $(seq 1 30); do
+	if grep -Fq '"rootfs"' /proc/mtd 2>/dev/null; then
+		break
+	fi
+	sleep 1
+done
+for label in spl-primary spl-backup uboot bootfit rootfs; do
+	grep -Fq "\"$label\"" /proc/mtd || {
+		echo "ERROR: MTD partition did not appear: $label" >&2
+		exit 1
+	}
+done
+
+echo 'PHASE=install-nand'
+/bin/bash "$PAYLOAD_DIR/pcduino3b-nand-install" \
+	--install \
+	--payload-dir "$PAYLOAD_DIR" \
+	--backup-sha256 "$PCDUINO3B_NAND_BASELINE_BACKUP_SHA256" \
+	--host-backup-confirmed \
+	--confirm "ERASE-PCDUINO3B-NAND-$PCDUINO3B_NAND_ID"
+
+echo 'AUTOINSTALL_STATUS=PASS'
+stop_kernel_logger
+{
+	echo 'STATUS=PASS'
+	date -u '+FINISHED_UTC=%Y-%m-%dT%H:%M:%SZ'
+	echo "NAND_ID=$PCDUINO3B_NAND_ID"
+	sha256sum "$PAYLOAD_DIR/SHA256SUMS"
+} >"$STATE_DIR/SUCCESS.tmp"
+mv -f "$STATE_DIR/SUCCESS.tmp" "$STATE_DIR/SUCCESS.txt"
+rm -f "$STATE_DIR/IN_PROGRESS.txt" "$STATE_DIR/FAILED.txt"
+sync
+set_led_off
+trap - EXIT
+echo 'NEXT_STEP=remove_sd_then_power_on_for_nand_boot'
+systemctl poweroff

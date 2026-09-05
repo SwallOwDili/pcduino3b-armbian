@@ -49,8 +49,10 @@ jobs:
           go run github.com/rhysd/actionlint/cmd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106
 
           mapfile -d '' shell_files < <(
-            find userpatches scripts tests -type f \
-              \( -name '*.sh' -o -path '*/overlay/usr/local/sbin/pcduino3b-*' \) \
+            find userpatches scripts tests installer-card -type f \
+              \( -name '*.sh' \
+              -o -path '*/overlay/usr/local/sbin/pcduino3b-*' \
+              -o -path 'installer-card/pcduino3b-nand-autoinstall' \) \
               -print0 2>/dev/null || true
           )
           ((${#shell_files[@]} > 0)) || {

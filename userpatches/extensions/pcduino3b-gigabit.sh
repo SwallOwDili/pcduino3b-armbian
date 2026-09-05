@@ -25,10 +25,13 @@ function extension_prepare_config__pcduino3b_profile_dtb() {
 function extension_prepare_config__pcduino3b_nand_uboot_artifacts() {
 	case "${PCDUINO3B_IMAGE_PROFILE:-}" in
 		nand-installer | nand-recovery)
-			# Keep the normal SD boot binary and also package the two images needed
-			# by the Allwinner BROM NAND layout.  The special SPL already contains
-			# the required randomizer/ECC encoding.
-			UBOOT_TARGET_MAP=';;u-boot-sunxi-with-spl.bin spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
+			# Build two independent configurations. Target 1 is deliberately
+			# MMC-only and is written to the installer SD. Target 2 enables raw
+			# NAND and supplies the SPL/U-Boot payload installed onto the board.
+			# Sharing one NAND-enabled binary between both roles previously made
+			# the recovery SD hang during U-Boot's early NAND initialization.
+			UBOOT_TARGET_MAP=';;u-boot-sunxi-with-spl.bin
+;;spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
 			;;
 	esac
 }

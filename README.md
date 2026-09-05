@@ -47,7 +47,7 @@ pcDuino3B 专用设备树以其上游 A20 板级定义为兼容基础，只表�
 | --- | --- | --- |
 | `dev` | 快速网络、身份和板级验证 | Minimal；快速产物；不创建正式 Release |
 | `sd-release` | 日常 microSD 系统 | 完整验收；xz；SHA-256 |
-| `nand-installer` | 4GiB NAND 安装入口 | Minimal；基准 DTB + 固定布局 overlay；带显式安全门的安装器和 CI 生成的 raw FIT + SLC UBI bundle |
+| `nand-installer` | 4GiB NAND 自动安装卡 | Minimal；写卡后开机自动烧录 NAND、校验、记录日志并关机；不需要 SSH 或手动命令 |
 | `nand-recovery` | NAND 备份、恢复入口 | Minimal；基准 DTB + 无分区 recovery overlay；默认只读探测 |
 
 NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`pcduino3b-nand-rootfs`、`pcduino3b-nand-layout` 和 `pcduino3b-nand-boot.itb`。NAND 实验不进入普通 `sd-release` 镜像路径。
@@ -60,7 +60,7 @@ NAND 命名保留为 `pcduino3b-nand-installer`、`pcduino3b-nand-recovery`、`p
 
 同日只读扫描确认 4 个已有坏块，位置为 `0xfe400000`、`0xfe600000`、`0xffc00000`、`0xffe00000`；除前约 28 MiB 的旧引导数据外，其余区域基本为空。已完成包含 OOB 的全盘原始备份，大小 `4,630,511,616` 字节，SHA-256 为 `42e946fff07ebbc0f1a3c4e84c14e99fd57566624b42042edc826c03efeab1d3`，并在独立主机副本上复核一致。
 
-NAND installer 使用版本 2 布局：ECC 编码 SPL 主/备份分别位于 0 和 4 MiB，U-Boot proper 位于 8 MiB，32–128 MiB 是 U-Boot 可直接读取的 raw boot FIT，128 MiB 之后由 Linux 以 paired-page `slc-mode` 暴露为约 1984 MiB 逻辑 UBI `rootfs`。这是因为 Hynix MLC 原始分区会被 UBI 明确拒绝，而 U-Boot 又不能解释 Linux 的 SLC-on-MLC 映射。U-Boot 保持 microSD 优先；拔卡后读取并校验 FIT，再由 FIT 中的内核和运行时 DTB 挂载 SLC UBI。GitHub Actions 从已验收的 installer SD rootfs 生成 FIT、`pcduino3b-nand-rootfs.ubi` 和校验 bundle，安装器在任何擦除前核对板型、启动介质、精确 NAND ID/几何、SLC 标志、boot 区坏块、整包 SHA-256 和主机备份回执。代码和静态测试已就绪，但在同一 CI 候选尚未完成实体板写入/拔卡启动测试前，仍不宣称已经可从 NAND 启动。
+NAND installer 使用版本 2 布局：ECC 编码 SPL 主/备份分别位于 0 和 4 MiB，U-Boot proper 位于 8 MiB，32–128 MiB 是 U-Boot 可直接读取的 raw boot FIT，128 MiB 之后由 Linux 以 paired-page `slc-mode` 暴露为约 1984 MiB 逻辑 UBI `rootfs`。这是因为 Hynix MLC 原始分区会被 UBI 明确拒绝，而 U-Boot 又不能解释 Linux 的 SLC-on-MLC 映射。构建分别生成安装卡自身使用的 MMC-only U-Boot 和写入 NAND 的 NAND U-Boot；前者不探测 NAND，后者使用实测的 8 KiB page、640 B OOB。最终候选是自包含的自动安装 SD 镜像：开机后在 userspace 显式加载 `sunxi_nand`，完成全部写入和回读，再把状态、内核日志及 journal 写到可由普通电脑读取的 `PCD3BINS` FAT 分区并自动关机。用户不需要 SSH、上传 bundle 或手动运行安装器。代码、静态测试和整卡离线装配测试已通过，但在同一 CI 候选尚未完成实体板写入/拔卡启动测试前，仍不宣称已经可从 NAND 启动。
 
 ## 板端验收
 

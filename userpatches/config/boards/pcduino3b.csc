@@ -22,8 +22,8 @@ function post_config_uboot_target__extra_configs_for_pcduino3b() {
 	run_host_command_logged scripts/config --set-str CONFIG_DEFAULT_DEVICE_TREE "sun7i-a20-pcduino3b"
 	run_host_command_logged scripts/config --set-str CONFIG_OF_LIST "sun7i-a20-pcduino3b"
 
-	case "${PCDUINO3B_IMAGE_PROFILE:-}" in
-		nand-installer | nand-recovery)
+	case "${PCDUINO3B_IMAGE_PROFILE:-}:${uboot_target_counter:-1}" in
+		nand-installer:2 | nand-recovery:2)
 			display_alert "$BOARD" "enable NAND-capable U-Boot" "info"
 			run_host_command_logged scripts/config --enable CONFIG_MTD
 			run_host_command_logged scripts/config --enable CONFIG_MTD_RAW_NAND
@@ -45,9 +45,19 @@ function post_config_uboot_target__extra_configs_for_pcduino3b() {
 			run_host_command_logged scripts/config --set-val CONFIG_NAND_SUNXI_SPL_ECC_SIZE "1024"
 			run_host_command_logged scripts/config --set-val CONFIG_NAND_SUNXI_SPL_USABLE_PAGE_SIZE "1024"
 			run_host_command_logged scripts/config --set-val CONFIG_SYS_NAND_BLOCK_SIZE "0x200000"
-			run_host_command_logged scripts/config --set-val CONFIG_SYS_NAND_PAGE_SIZE "8192"
-			run_host_command_logged scripts/config --set-val CONFIG_SYS_NAND_OOBSIZE "640"
+			run_host_command_logged scripts/config --set-val CONFIG_SYS_NAND_PAGE_SIZE "0x2000"
+			run_host_command_logged scripts/config --set-val CONFIG_SYS_NAND_OOBSIZE "0x280"
 			run_host_command_logged scripts/config --set-val CONFIG_SYS_NAND_U_BOOT_OFFS "0x800000"
+			;;
+		nand-installer:1 | nand-recovery:1)
+			# Target 1 is the bootloader written to the installer SD.  It must
+			# remain on the already hardware-accepted MMC-only path; probing the
+			# onboard NAND from U-Boot previously stopped this board before Linux.
+			display_alert "$BOARD" "keep installer SD U-Boot NAND-free" "info"
+			run_host_command_logged scripts/config --disable CONFIG_MTD_RAW_NAND
+			run_host_command_logged scripts/config --disable CONFIG_NAND_SUNXI
+			run_host_command_logged scripts/config --disable CONFIG_CMD_NAND
+			run_host_command_logged scripts/config --disable CONFIG_SPL_NAND_SUPPORT
 			;;
 	esac
 }

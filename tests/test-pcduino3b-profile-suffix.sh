@@ -57,8 +57,10 @@ assert_uboot_targets() {
 
 assert_uboot_targets dev ';;u-boot-sunxi-with-spl.bin'
 assert_uboot_targets sd-release ';;u-boot-sunxi-with-spl.bin'
-assert_uboot_targets nand-installer ';;u-boot-sunxi-with-spl.bin spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
-assert_uboot_targets nand-recovery ';;u-boot-sunxi-with-spl.bin spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
+assert_uboot_targets nand-installer ';;u-boot-sunxi-with-spl.bin
+;;spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
+assert_uboot_targets nand-recovery ';;u-boot-sunxi-with-spl.bin
+;;spl/sunxi-spl-with-ecc.bin:pcduino3b-nand-spl-with-ecc.bin u-boot-dtb.bin:pcduino3b-nand-u-boot.bin'
 
 ADDED_PACKAGES=()
 PCDUINO3B_EXTRA_PACKAGES="curl ethtool openssh-server"
