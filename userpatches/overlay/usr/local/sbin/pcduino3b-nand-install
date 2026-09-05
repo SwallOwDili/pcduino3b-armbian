@@ -23,10 +23,16 @@ Usage:
   pcduino3b-nand-install --install --payload-dir DIR \
     --backup-sha256 HEX --host-backup-confirmed \
     --confirm ERASE-PCDUINO3B-NAND-add794916044
+  pcduino3b-nand-install --install-rootfs --payload-dir DIR \
+    --backup-sha256 HEX --host-backup-confirmed \
+    --confirm ERASE-PCDUINO3B-NAND-add794916044
 
-Without --install the command performs validation and prints the write plan.
-The install mode erases only the fixed NAND partitions declared by the
-pcduino3b-nand-layout overlay. It never writes a whole-disk block device.
+Without a write mode the command validates and prints the write plan.
+--install-rootfs writes and validates only SLC UBI/UBIFS, then stops before
+boot FIT, SPL or U-Boot writes. It does not make NAND independently bootable.
+--install writes all fixed partitions declared by pcduino3b-nand-layout.
+Neither mode writes a whole-disk block device. Both require the same backup
+and destructive confirmation checks.
 USAGE
 }
 
@@ -133,7 +139,13 @@ abort_on_signal() {
 while (($#)); do
 	case "$1" in
 		--install)
+			[[ "$MODE" == plan ]] || die 'choose only one write mode'
 			MODE=install
+			shift
+			;;
+		--install-rootfs)
+			[[ "$MODE" == plan ]] || die 'choose only one write mode'
+			MODE=rootfs
 			shift
 			;;
 		--payload-dir)
@@ -398,7 +410,7 @@ for _ in {1..30}; do
 done
 [[ -e /dev/ubi0_0 ]] || die 'UBI rootfs volume did not appear'
 ubinfo -a
-mount -t ubifs -o ro ubi0:rootfs "$MOUNT_DIR"
+mount -t ubifs -o ro,chk_data_crc ubi0:rootfs "$MOUNT_DIR"
 grep -qx 'VERSION_CODENAME=noble' "$MOUNT_DIR/etc/os-release"
 grep -qx 'ARMBIAN_BOARD=pcduino3b' "$MOUNT_DIR/etc/pcduino3b-build-info"
 grep -qx 'IMAGE_PROFILE=nand-rootfs' "$MOUNT_DIR/etc/pcduino3b-build-info"
@@ -414,6 +426,17 @@ umount "$MOUNT_DIR"
 ubidetach /dev/ubi_ctrl -m "$UBI_MTD_NUM"
 ATTACHED_MTD=
 
+if [[ "$MODE" == rootfs ]]; then
+	sync
+	echo 'ROOTFS_INSTALL_STATUS=PASS'
+	echo 'BOOTFIT_WRITE=NOT_REQUESTED'
+	echo 'SPL_UBOOT_WRITE=NOT_REQUESTED'
+	echo 'NAND_BOOT_ACCEPTANCE=NOT_TESTED'
+	echo "INSTALL_LOG=$LOG_FILE"
+	echo 'NEXT_STEP=keep_sd_inserted_and_validate_boot_chain_separately'
+	exit 0
+fi
+
 verify_bootfit() {
 	local readback="$MOUNT_DIR/boot.itb"
 	nanddump --quiet --bb=skipbad --length "$BOOTFIT_BYTES" \
@@ -423,7 +446,8 @@ verify_bootfit() {
 }
 
 verify_raw_spl() {
-	local device="$1" label="$2" readback="$MOUNT_DIR/${label}.raw"
+	local device="$1" label="$2"
+	local readback="$MOUNT_DIR/${label}.raw"
 	nanddump --quiet --bb=dumpbad --noecc --oob \
 		--length "$SPL_DATA_BYTES" --file "$readback" "$device"
 	cmp "$SPL_IMAGE" "$readback"

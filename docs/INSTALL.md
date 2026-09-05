@@ -1,6 +1,6 @@
 # pcDuino3B Armbian 安装与验收
 
-本项目的日常系统是 **microSD 启动镜像**。先用 microSD 完成身份、千兆网络和外设回归；当前 NAND 状态尚不具备写入安装条件，不要覆盖板载 NAND。
+本项目的日常系统是 **microSD 启动镜像**。先用 microSD 完成身份、千兆网络和外设回归；NAND 的 SLC 根分区已进入实机验证，但完整 NAND 独立启动尚未验收，不要把候选包当成已验证的 NAND 启动系统。
 
 ## 1. 下载并核对候选文件
 
@@ -212,7 +212,11 @@ sudo pcduino3b-nand-install \
   --confirm ERASE-PCDUINO3B-NAND-add794916044
 ```
 
-写入顺序是 SLC UBI rootfs、raw boot FIT、备用 SPL、U-Boot、主 SPL。每一步都在进入下一步前做读回比较；UBI 会重新挂载为只读并检查 Noble、`nand-rootfs` 身份、内核、initrd、boot script、DTB 与 overlay，FIT 也会读回比较并重新解析。把主 SPL 放在最后，确保前面任一步失败都不会把现有启动入口改成半成品。脚本成功后不会自动重启，先保存 `/var/log/pcduino3b-nand-install-*.log`，再关机、拔出 microSD 并测试 NAND 启动。若失败，重新插入 recovery SD；不要在未确认日志和分区状态时重复整片擦除。
+写入顺序是 SLC UBI rootfs、raw boot FIT、备用 SPL、U-Boot、主 SPL。每一步都在进入下一步前做校验；UBI 会以 `ro,chk_data_crc` 挂载并检查 Noble、`nand-rootfs` 身份、内核、initrd、boot script 与 overlay，FIT 和引导文件会读回比较。把主 SPL 放在最后，确保前面任一步失败都不会把现有启动入口改成半成品。脚本成功后不会自动重启，先保存 `/var/log/pcduino3b-nand-install-*.log`，再关机、拔出 microSD 并测试 NAND 启动。若失败，重新插入经过验证的 recovery SD；不要在未确认日志和分区状态时重复整片擦除。
+
+只验证 SLC/UBI 时，将上述 `--install` 改为 `--install-rootfs`，其余备份和确认参数不能省略。该模式依然会擦写 `rootfs` 分区，但在成功挂载、检查、卸载并分离 UBI 后立即退出，绝不继续写入 boot FIT、备用 SPL、U-Boot 或主 SPL。它输出 `ROOTFS_INSTALL_STATUS=PASS`，而不是完整安装的 `INSTALL_STATUS=PASS`；此时必须保留 SD 卡，不能据此宣称 NAND 可独立启动。两种写入模式不能混用。
+
+`chk_data_crc` 会启用 UBIFS 文件数据节点的 CRC 检查；默认跳过该检查可能漏掉数据损坏，参见 [Linux UBIFS 挂载选项](https://docs.kernel.org/filesystems/ubifs.html#mount-options)。旧 NAND 的不纠错 raw/OOB 读数可能有瞬时位差异，不能单凭两次原始哈希不同断言发生了擦写；保留原始备份并分别记录 ECC、文件数据校验和实际执行过的写入阶段。
 
 安装链路虽已实现并有静态/镜像验收门，但在 CI 产物写入这块实体板并完成拔卡启动、SSH、千兆网及 `pcduino3b-selftest` 之前，发布状态仍必须保持 `HARDWARE_ACCEPTANCE=PENDING`。
 

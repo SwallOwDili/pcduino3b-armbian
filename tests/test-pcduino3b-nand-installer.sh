@@ -36,6 +36,51 @@ for guard in \
 	grep -Fq -- "$guard" "$INSTALLER"
 done
 
+"$INSTALLER" --help | grep -Fq -- '--install-rootfs'
+grep -Fq "die 'choose only one write mode'" "$INSTALLER"
+if mixed_mode_output=$("$INSTALLER" --install --install-rootfs 2>&1); then
+	echo 'mixed write modes must fail before accessing MTD devices' >&2
+	exit 1
+fi
+grep -Fq 'choose only one write mode' <<<"$mixed_mode_output"
+grep -Fq 'mount -t ubifs -o ro,chk_data_crc' "$INSTALLER"
+rootfs_only_stop_line=$(grep -n 'if \[\[ "$MODE" == rootfs \]\]; then' \
+	"$INSTALLER" | cut -d: -f1)
+boot_write_line=$(grep -n "PHASE=write-boot-fit" "$INSTALLER" | cut -d: -f1)
+rootfs_detach_line=$(grep -n '^ubidetach /dev/ubi_ctrl' "$INSTALLER" | cut -d: -f1)
+((rootfs_only_stop_line > rootfs_detach_line))
+((rootfs_only_stop_line < boot_write_line))
+rootfs_only_stop=$(sed -n '/^if \[\[ "$MODE" == rootfs \]\]; then/,/^fi$/p' "$INSTALLER")
+for marker in ROOTFS_INSTALL_STATUS=PASS BOOTFIT_WRITE=NOT_REQUESTED \
+	SPL_UBOOT_WRITE=NOT_REQUESTED NAND_BOOT_ACCEPTANCE=NOT_TESTED; do
+	grep -Fq "$marker" <<<"$rootfs_only_stop"
+done
+grep -Fq 'exit 0' <<<"$rootfs_only_stop"
+
+# Exercise the real readback function without MTD hardware. Expanding `label`
+# in the same local declaration that assigns it aborts with nounset (or uses
+# a stale global value), after the backup SPL has already been written.
+(
+	unset label
+	MOUNT_DIR=/test-mount
+	SPL_DATA_BYTES=8192
+	SPL_IMAGE=/test-spl
+	eval "$(sed -n '/^verify_raw_spl() {/,/^}/p' "$INSTALLER")"
+	nanddump() {
+		[[ "$*" == "--quiet --bb=dumpbad --noecc --oob --length 8192 --file /test-mount/$expected_label.raw $expected_device" ]]
+	}
+	cmp() {
+		[[ "$1" == /test-spl && "$2" == "/test-mount/$expected_label.raw" ]]
+	}
+	expected_label=spl-backup
+	expected_device=/dev/mtd3
+	verify_raw_spl "$expected_device" "$expected_label"
+	label=must-not-leak-from-global
+	expected_label=spl-primary
+	expected_device=/dev/mtd4
+	verify_raw_spl "$expected_device" "$expected_label"
+)
+
 plan_exit_line=$(grep -n "NAND_WRITE=NOT_REQUESTED" "$INSTALLER" | cut -d: -f1)
 first_write_line=$(grep -nE '^[[:space:]]*(ubiformat|flash_erase|nandwrite)[[:space:]]' \
 	"$INSTALLER" | head -n1 | cut -d: -f1)
