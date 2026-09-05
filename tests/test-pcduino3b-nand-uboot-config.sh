@@ -66,6 +66,13 @@ assert_profile nand-installer 2 yes
 assert_profile nand-recovery 1 no
 assert_profile nand-recovery 2 yes
 
+WORKFLOW="$REPO_ROOT/.github/workflows/image-build.yml"
+grep -Fq 'if sudo grep -Eq "^${option}=y$" "${sd_uboot_configs[0]}"; then' "$WORKFLOW"
+if grep -Fq 'grep -Fxq "# $option is not set" "${sd_uboot_configs[0]}"' "$WORKFLOW"; then
+	echo 'SD U-Boot acceptance incorrectly requires disabled Kconfig symbols to be emitted' >&2
+	exit 1
+fi
+
 UBOOT_PATCH="$REPO_ROOT/userpatches/u-boot/v2026.07-sunxi/board_pcduino3b/0001-pcduino3b-enable-onboard-nand.patch"
 for expected in \
 	'sun7i-a20-pcduino3b.dts' \

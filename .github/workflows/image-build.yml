@@ -703,7 +703,10 @@ jobs:
                 sudo find "$mount_dir/usr/lib" -type f \
                   -name pcduino3b-nand-u-boot.bin -print
               )
-              [[ ${#nand_spl_files[@]} -eq 1 && ${#nand_uboot_files[@]} -eq 1 ]]
+              [[ ${#nand_spl_files[@]} -eq 1 && ${#nand_uboot_files[@]} -eq 1 ]] || {
+                echo "Expected one NAND SPL and one NAND U-Boot; found SPL=${#nand_spl_files[@]} U-Boot=${#nand_uboot_files[@]}" >&2
+                exit 1
+              }
               mapfile -t sd_uboot_files < <(
                 sudo find "$mount_dir/usr/lib" -type f \
                   -name u-boot-sunxi-with-spl.bin -print
@@ -716,8 +719,14 @@ jobs:
                 sudo find "$mount_dir/usr/lib" -type f \
                   -name u-boot-config-target-2 -print
               )
-              [[ ${#sd_uboot_files[@]} -eq 1 ]]
-              [[ ${#sd_uboot_configs[@]} -eq 1 && ${#nand_uboot_configs[@]} -eq 1 ]]
+              [[ ${#sd_uboot_files[@]} -eq 1 ]] || {
+                echo "Expected one installer-SD U-Boot; found ${#sd_uboot_files[@]}" >&2
+                exit 1
+              }
+              [[ ${#sd_uboot_configs[@]} -eq 1 && ${#nand_uboot_configs[@]} -eq 1 ]] || {
+                echo "Expected one config per U-Boot target; found SD=${#sd_uboot_configs[@]} NAND=${#nand_uboot_configs[@]}" >&2
+                exit 1
+              }
 
               # The card itself must contain the MMC-only target at the exact
               # sunxi boot offset.  The separately packaged target is the only
@@ -727,7 +736,13 @@ jobs:
                 CONFIG_NAND_SUNXI \
                 CONFIG_CMD_NAND \
                 CONFIG_SPL_NAND_SUPPORT; do
-                sudo grep -Fxq "# $option is not set" "${sd_uboot_configs[0]}"
+                # Kconfig omits symbols whose parent menu is disabled, so an
+                # absent line and "# ... is not set" both mean disabled.  The
+                # safety property is that none of these symbols is enabled.
+                if sudo grep -Eq "^${option}=y$" "${sd_uboot_configs[0]}"; then
+                  echo "Installer SD U-Boot unexpectedly enables $option" >&2
+                  exit 1
+                fi
               done
               for option in \
                 CONFIG_MTD_RAW_NAND=y \
@@ -736,20 +751,45 @@ jobs:
                 CONFIG_SPL_NAND_SUPPORT=y \
                 CONFIG_SYS_NAND_PAGE_SIZE=0x2000 \
                 CONFIG_SYS_NAND_OOBSIZE=0x280; do
-                sudo grep -Fxq "$option" "${nand_uboot_configs[0]}"
+                sudo grep -Fxq "$option" "${nand_uboot_configs[0]}" || {
+                  echo "NAND U-Boot config is missing $option" >&2
+                  exit 1
+                }
               done
               sd_uboot_bytes=$(sudo stat -c %s "${sd_uboot_files[0]}")
-              ((sd_uboot_bytes > 0 && sd_uboot_bytes < 1040384))
+              ((sd_uboot_bytes > 0 && sd_uboot_bytes < 1040384)) || {
+                echo "Installer-SD U-Boot has invalid size: $sd_uboot_bytes" >&2
+                exit 1
+              }
               sudo cmp --bytes="$sd_uboot_bytes" --ignore-initial=8192:0 \
-                "$raw_image" "${sd_uboot_files[0]}"
+                "$raw_image" "${sd_uboot_files[0]}" || {
+                  echo 'Installer image does not contain the MMC-only U-Boot at offset 8192' >&2
+                  exit 1
+                }
               # 24 physical pages, each containing 8192 data + 640 OOB bytes.
-              [[ "$(sudo stat -c %s "${nand_spl_files[0]}")" -eq 211968 ]]
+              nand_spl_bytes=$(sudo stat -c %s "${nand_spl_files[0]}")
+              [[ "$nand_spl_bytes" -eq 211968 ]] || {
+                echo "NAND SPL has invalid encoded size: $nand_spl_bytes" >&2
+                exit 1
+              }
               nand_uboot_bytes=$(sudo stat -c %s "${nand_uboot_files[0]}")
-              ((nand_uboot_bytes > 0 && nand_uboot_bytes <= 0xc0000))
-              sudo grep -aFq 'H27UBG8T2CTR-BC' "${nand_uboot_files[0]}"
+              ((nand_uboot_bytes > 0 && nand_uboot_bytes <= 0xc0000)) || {
+                echo "NAND U-Boot has invalid size: $nand_uboot_bytes" >&2
+                exit 1
+              }
+              sudo grep -aFq 'H27UBG8T2CTR-BC' "${nand_uboot_files[0]}" || {
+                echo 'NAND U-Boot lacks the H27UBG8T2CTR-BC device entry' >&2
+                exit 1
+              }
               sudo grep -aFq 'nand read 0x50000000 0x02000000 0x04000000' \
-                "${nand_uboot_files[0]}"
-              sudo grep -aFq 'bootm 0x50000000' "${nand_uboot_files[0]}"
+                "${nand_uboot_files[0]}" || {
+                  echo 'NAND U-Boot lacks the raw FIT read command' >&2
+                  exit 1
+                }
+              sudo grep -aFq 'bootm 0x50000000' "${nand_uboot_files[0]}" || {
+                echo 'NAND U-Boot lacks the FIT boot command' >&2
+                exit 1
+              }
               if sudo grep -aFq 'bootcmd_ubifs0=' "${nand_uboot_files[0]}"; then
                 echo 'U-Boot must not read the SLC-emulated rootfs UBI' >&2
                 exit 1
